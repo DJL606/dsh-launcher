@@ -1,7 +1,7 @@
 v0.6.7 改动与验证记录
 =====================
 生成时间：2026-09-27 凌晨（本轮）
-源码：D:\deepseekhs\dsh-launcher\launcher.cs（0.6.6 → 0.6.7，3840 → 3966 行）
+源码：launcher.cs（0.6.6 → 0.6.7，3840 → 3966 行）
 构建脚本：build-v067.cmd（纯 ASCII，已校验无 >127 字节）
 文档：使用说明.txt（v0.6.7 章节已写）
 
@@ -30,7 +30,7 @@ v0.6.7 改动与验证记录
 
 3) 检查 bug（本轮实修 / 实证）
    · 修：启动环境净化 —— 命令行清 NODE_OPTIONS + CODEBUDDY_SAFE_DELETE_BULK_GUARD。
-     实测根因：dsh 写配置时删自己的 .lock，WorkBuddy 注入的 node 语言 shim 的
+     实测根因：dsh 写配置时删自己的 .lock，某些宿主环境注入的 node 语言 shim 的
      safe-delete 守卫会拦下它 → dsh 报
      `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] ... .credentials.yaml.lock`
      直接启动失败；清掉即恢复。另：上次异常退出残留的 .lock 会让 dsh 卡在
@@ -44,7 +44,7 @@ v0.6.7 改动与验证记录
    · 原插件 @nanmicoder/dsh-auto-mode：npm 最新 0.1.10 只支持到 0.1.5-rc.2，
      与本机 0.1.5-rc.3 不兼容 → 无可用更新版本 → 删除。
      已删：profile 配置引用（昨天已做）+ 今天删掉 node_modules 里的残留目录。
-     **未动**：开发检查点 D:\deepseekhs\dsh-auto-mode（源码还在）。
+     **未动**：开发检查点 dsh-auto-mode
    · 替代：dsh-perm-gate@4.1.5（2026-09-26 发布，专为 0.1.5 线维护，32 个版本，
      engines.dsh = >=0.1.5-rc.1 <0.1.6-0，无加载期版本断言 → 不会重演混版崩溃）。
      安装方式：文件级（npm pack 解包到 profile node_modules + 只装运行时依赖 chokidar@5
@@ -57,7 +57,7 @@ v0.6.7 改动与验证记录
 二、验证证据（无编译器情况下能做的都做了）
 ------------------------------------------
 1) 逻辑移植测试（JS 逐行移植 + 真实数据）：**14 项断言全过**
-   C:\Users\ROG\AppData\Local\Temp\dsh-v067-logic-test.js
+   %TEMP%\dsh-v067-logic-test.js
    · VersionSatisfies 10 项：区间/上界/^/~ 与 || 组合、0.x caret 语义
    · 真实 npm 固定样本 3 项：perm-gate@4.2.1 → **拦下**（5 条约束含 0.1.7 要求）、
      perm-gate@4.1.5 → 可升级、agent-teams@0.1.21（21 条约束）→ 可升级
@@ -103,5 +103,4 @@ v0.6.7 改动与验证记录
   （perm-gate 4.2.1 会被拦下并说明原因；bridge-browser 是本地 link 包，不参与）
 · 回滚：旧版 exe 都还在同目录；本轮所有配置改动均有 .backup-* 备份
   （profile 配置、settings.yaml、预设 agent.cordis.yml）
-· 环境说明：本环境安全策略硬禁 csc.exe（"equivalent to Add-Type"，不可授权绕过），
-  所以每次改完源码都要你双击一次 build-v0XX.cmd。
+· 编译方式：每次改完源码双击一次 build-v0XX.cmd（脚本自带环境与字节量预检）。

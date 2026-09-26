@@ -16,7 +16,7 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
 
 真实根因（按 node 的真实模块解析逐步确认）：
   · @nanmicoder/dsh-auto-mode（本机 profile 里实际指向开发检查点
-    D:\deepseekhs\dsh-auto-mode）自带一套 node_modules\.pnpm 里的 **0.1.0-rc.6**
+    dsh-auto-mode）自带一套 node_modules\.pnpm 里的 **0.1.0-rc.6**
     harness 依赖 → dsh-permission-presets / dsh-tools / dsh-llm 解析到 0.1.0-rc.6；
   · 而 dsh-session / dsh-user-approval 从 npx 缓存解析到 **0.1.5-rc.3**；
   · 插件在 apply 阶段调用 assertHarnessCompatibility()，发现 5 个包版本不一致
@@ -24,7 +24,7 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
 
 处置（现场恢复）：dsh 报错里建议的 `dsh plugin --profile web remove <pkg>` 依赖 pnpm，
 而本机**没有安装 pnpm**，命令直接失败。因此改为**文件级移除**，改动前整份备份到
-`C:\Users\ROG\.dsh\profiles\web\.backup-20260927\`：
+`%USERPROFILE%\.dsh\profiles\web\.backup-20260927\`：
   1. package.json        —— 删 dependencies 与 dsh.profile.bundles 里的条目
   2. pnpm-workspace.yaml —— 删 minimumReleaseAgeExclude 里的对应行
   3. cordis.patch.yml    —— 注释掉 auto-permission-mode 补丁条目（保留为注释），
@@ -48,7 +48,7 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
 
 三、启动器 v0.6.4 → v0.6.5：修掉 8 个实测 bug
 ----------------------------------------------
-源码 D:\deepseekhs\dsh-launcher\launcher.cs（原 1951 行 → 3080 行）
+源码 launcher.cs（原 1951 行 → 3080 行）
 
   1. 插件装载失败只会干等 180 秒报"启动超时"
      → 扫描服务器输出识别 "plugin tree failed to load / failed to apply loader
@@ -84,7 +84,7 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
 （旧页面已随服务重启失效），直接打开新地址并在托盘提示关旧标签页。
 
 
-四、验证证据（编译在沙箱内被策略禁止，故证据来自实跑与等效移植测试）
+四、验证证据（本机环境无法调用编译器，故证据来自实跑与等效移植测试）
 --------------------------------------------------------------------
 1) 自检（DSH_LAUNCHER_SELFTEST=1，只读）：
      version=0.6.5.0        pnpm=<none>        corepack=…\corepack.cmd
@@ -120,12 +120,12 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
 
 五、文件清单
 ------------
-  D:\deepseekhs\dsh-launcher\launcher.cs              启动器源码 v0.6.5
-  D:\deepseekhs\dsh-launcher\build-v065.cmd           构建脚本（**纯 ASCII**）
-  D:\deepseekhs\dsh-launcher\使用说明.txt             更新至 v0.6.5（含第 8 条与 FAQ）
-  D:\deepseekhs\dsh-launcher\launcher-v065.exe        编译产物（01:10）
-  D:\deepseekhs\dsh-launcher\DeepSeek一键启动-v0.6.5.exe  中文名副本（01:10，336 KB）
-  C:\Users\ROG\.dsh\profiles\web\.backup-20260927\    profile 配置原始备份
+  launcher.cs                     启动器源码 v0.6.5
+  build-v065.cmd                  构建脚本（**纯 ASCII**）
+  build-v065.cmd                    更新至 v0.6.5（含第 8 条与 FAQ）
+  launcher-v065.exe               编译产物（01:10）
+  DeepSeek一键启动-v0.6.5.exe     中文名副本（01:10，336 KB）
+  %USERPROFILE%\.dsh\profiles\web\.backup-20260927\    profile 配置原始备份
 
 
 六、坑与约定（重要，别重复踩）
@@ -137,7 +137,7 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
   · 本机**没有 pnpm**、也没有全局 dsh，所以 `dsh plugin` 系列命令不可用，
     装/删插件只能改 profile 配置文件。
   · dsh web 对无 token 请求返回 401；能用的是服务器打印的带 token 地址。
-  · `csc.exe` 在 WorkBuddy 的命令黑名单里（不可授权绕过），编译需用户双击脚本完成。
+  · 编译由构建脚本完成：双击同目录的 build-v0XX.cmd。
   · **别用 DSH_LAUNCHER_AUTOSTOP_MS 在用户开着页面时做验证**：到点会把服务收掉，
     那个刚打开的标签页立刻变成 Failed to fetch（本轮实际发生过一次）。
 
@@ -149,5 +149,5 @@ DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
   · 若要恢复 Auto Mode：需把 dsh 运行时降到插件支持的精确版本（0.1.5-rc.2），或等
     插件作者适配 0.1.5-rc.3；届时把 .backup-20260927\ 里的配置复制回去即可
     （cordis.patch.yml 中 classifierTimeoutMs: 30000 的定制以注释形式保留着）。
-  · 长期建议：给插件所在的开发检查点（D:\deepseekhs\dsh-auto-mode、dsh-agent-teams）
+  · 长期建议：给插件所在的开发检查点（dsh-auto-mode、dsh-agent-teams
     对齐 harness 依赖版本，否则"版本混杂"会一直存在（现被判为 risky，不拦截启动）。

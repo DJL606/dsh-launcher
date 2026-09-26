@@ -35,7 +35,7 @@ v0.6.7：一个出口 + 一处更新入口 + 启动环境净化 + 接口自检
    自动跳过、不参与更新的东西：
      · "link:"/"file:"/"workspace:" 规格的插件（本地开发包）
      · node_modules 里是符号链接/junction 的插件（指向本地开发检查点，
-       比如 @yuxianglin/dsh-bridge-browser → D:\deepseekhs\dsh-browser）
+       比如 @yuxianglin/dsh-bridge-browser → dsh-browser）
    ★ 关键安全闸门：只提示**与当前 dsh 版本相容**的插件版本。
      实测例子：dsh-perm-gate 4.2.1 只声明支持 >=0.1.7-rc.1 <0.1.8-0，
      而本机 dsh 是 0.1.5-rc.3 —— 若照"有新版本就升"提示，一升级就会重演
@@ -45,7 +45,7 @@ v0.6.7：一个出口 + 一处更新入口 + 启动环境净化 + 接口自检
 
 3) 启动环境净化（修一个会让 dsh 直接起不来的坑）
    实测：dsh 内部写配置时会删自己的 .lock 文件；如果启动器自身是从
-   WorkBuddy 这类宿主里被拉起的，会继承一个 node 语言 shim
+   某些宿主环境里被拉起的，会继承一个 node 语言 shim
    （NODE_OPTIONS=--require ...node-language-shim.cjs），它带的 safe-delete
    守卫会拦下这次删除，dsh 立刻以
    `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] ... .credentials.yaml.lock`
@@ -53,7 +53,7 @@ v0.6.7：一个出口 + 一处更新入口 + 启动环境净化 + 接口自检
    现在启动 dsh 前一律在命令行里 `set NODE_OPTIONS=` 与
    `set CODEBUDDY_SAFE_DELETE_BULK_GUARD=`，无论启动器从哪来都能正常起。
    顺带：锁文件残留（上次异常退出留下 .lock）也会导致同样的超时，
-   处理办法就是删掉 C:\Users\ROG\.dsh\ 下的 .credentials.yaml.lock / settings.yaml.lock。
+   处理办法就是删掉 %USERPROFILE%\.dsh\ 下的 .credentials.yaml.lock / settings.yaml.lock。
 
 4) 服务接口自检（启动后 6 秒、只记日志 + 失败时一条气泡）
    用带 token 的地址换 cookie，再 POST 一个只读接口（agentPresets/list）。
@@ -104,7 +104,7 @@ v0.6.5：修掉 8 个实测踩到的坑（重点在"插件不兼容"与"页面�
 ------------------------------------------------------------------
 背景：插件是按**具体 dsh 版本**声明兼容范围的。2026-09-27 实测踩到：dsh 运行时
 0.1.5-rc.3，而 @nanmicoder/dsh-auto-mode 只声明支持到 0.1.5-rc.2，且它链接到
-开发检查点 D:\deepseekhs\dsh-auto-mode，自带一套 0.1.0-rc.6 的 harness 依赖，
+开发检查点 dsh-auto-mode，自带一套 0.1.0-rc.6 的 harness 依赖，
 而 session/user-approval 落到 npx 缓存的 0.1.5-rc.3 → "mixed Harness packages"
 → 插件在 profile 装载阶段直接抛异常 → **整个服务起不来**。旧版启动器对此只能
 干等 180 秒然后报一句"启动超时"。

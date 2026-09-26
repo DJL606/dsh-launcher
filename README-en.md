@@ -100,6 +100,12 @@ Download `launcher-v0.6.7.exe` from [Releases](https://github.com/DJL606/dsh-lau
 
 > The exe is not code-signed, so Windows SmartScreen may warn about an unknown publisher. The source and build script are both in this repo, so you can build and verify it yourself.
 
+### Security note (please read)
+
+- The launcher writes the **tokenized local URL** into `%LOCALAPPDATA%\DeepSeekLauncher\launcher.log` (it is needed for troubleshooting). That token grants access to your local dsh service: **do not publish that log** (in issues, posts or repos). Redact the `?token=...` part before sharing.
+- The service only listens on `127.0.0.1`; it is not exposed to your network. If you change the bind address or add port forwarding, add access control yourself.
+- Logs also contain your file paths and plugin list; this repo's docs are redacted, so do the same when you post your own logs.
+
 **B. Build it yourself (recommended if you want to modify the code)**
 
 See [Build](#build) below.
