@@ -13,3 +13,6 @@
 Thumbs.db
 desktop.ini
 .vs/
+
+# 内部交接文档：不入公开仓库（只保留在本地工作目录）
+HANDOFF-*.md
