@@ -1,0 +1,153 @@
+DeepSeek 一键启动器 v0.6.5 —— 修复与验证记录（2026-09-27）
+==============================================================
+
+本文记录 2026-09-27 凌晨这一轮处理：从"dsh 打不开"一路查到启动器自身的缺陷，
+最终产出 v0.6.5（修掉 8 个实测 bug）及其验证证据。
+
+
+一、起始故障：dsh 完全起不来
+------------------------------
+现象：dsh 启动即崩，报
+
+    Error: dsh: plugin tree failed to load: failed to apply loader entry
+    auto-permission-mode (@nanmicoder/dsh-auto-mode): Auto Mode: unsupported or
+    mixed Harness packages (dsh-permission-presets@0.1.0-rc.6, dsh-tools@0.1.0-rc.6,
+    dsh-llm@0.1.0-rc.6, dsh-session@0.1.5-rc.3, dsh-user-approval@0.1.5-rc.3)
+
+真实根因（按 node 的真实模块解析逐步确认）：
+  · @nanmicoder/dsh-auto-mode（本机 profile 里实际指向开发检查点
+    D:\deepseekhs\dsh-auto-mode）自带一套 node_modules\.pnpm 里的 **0.1.0-rc.6**
+    harness 依赖 → dsh-permission-presets / dsh-tools / dsh-llm 解析到 0.1.0-rc.6；
+  · 而 dsh-session / dsh-user-approval 从 npx 缓存解析到 **0.1.5-rc.3**；
+  · 插件在 apply 阶段调用 assertHarnessCompatibility()，发现 5 个包版本不一致
+    → 抛异常 → **整个 profile 装载失败，服务完全起不来**。
+
+处置（现场恢复）：dsh 报错里建议的 `dsh plugin --profile web remove <pkg>` 依赖 pnpm，
+而本机**没有安装 pnpm**，命令直接失败。因此改为**文件级移除**，改动前整份备份到
+`C:\Users\ROG\.dsh\profiles\web\.backup-20260927\`：
+  1. package.json        —— 删 dependencies 与 dsh.profile.bundles 里的条目
+  2. pnpm-workspace.yaml —— 删 minimumReleaseAgeExclude 里的对应行
+  3. cordis.patch.yml    —— 注释掉 auto-permission-mode 补丁条目（保留为注释），
+                            并补上顶层 `[]`（否则 dsh 报
+                            "overlay ... must be a top-level YAML array" 启动失败）
+验证：`npx @deepseek-ai/dsh --profile web` 启动成功，输出 http://127.0.0.1:3080/。
+
+
+二、第二个故障：页面报 "Failed to fetch"
+------------------------------------------
+现象：dsh 界面能打开，但报
+    client api: agentPresets/list failed: Failed to fetch
+
+结论：**服务端根本没在运行**（3080 无监听、curl 返回 502），浏览器里是缓存的旧页面，
+所有 RPC 请求自然失败。与插件移除无关——`@deepseek-ai/dsh-agent-presets` 由基础包
+`@deepseek-ai/dsh-web-app` 提供，仍在加载列表里。
+
+同一现象还有第二种成因（v0.6.5 已能识别）：3080 上有 node 进程在监听、但 HTTP
+完全不回应（崩溃残留 / 被强杀的旧启动器留下的"半死"进程）→ 页面同样 Failed to fetch。
+
+
+三、启动器 v0.6.4 → v0.6.5：修掉 8 个实测 bug
+----------------------------------------------
+源码 D:\deepseekhs\dsh-launcher\launcher.cs（原 1951 行 → 3080 行）
+
+  1. 插件装载失败只会干等 180 秒报"启动超时"
+     → 扫描服务器输出识别 "plugin tree failed to load / failed to apply loader
+       entry <id> (<插件>)"，解析出插件名与装载条目 id，**立即**弹修复询问。
+  2. 报错建议的 `dsh plugin remove` 依赖 pnpm（本机没装）→ 改用**文件级禁用**：
+     改 package.json / pnpm-workspace.yaml / cordis.patch.yml，先备份到
+     .backup-<时间戳>，再自动用记录版本重启服务。仅需用户点一次"是"。
+  3. 打开的是裸地址（dsh 对无 token 请求返回 401）→ 抓服务器 stdout 里的
+     `dsh web: http://127.0.0.1:3080/?token=…`，用它打开浏览器。
+  4. 健康服务返回 401 被当异常 → 误报"3080 被其他程序占用"；
+     现改为"HTTP 层有响应 + 占用者是 node"即视为 dsh。
+  5. 3080 被"半死"服务占着时静默复用（Failed to fetch 的根源）→ 询问
+     "结束它并按记录版本重新启动"。
+  6. 启动等待期间点"停止"仍要等满 180 秒 → 立即收手。
+  7. 插件兼容性没有预检 → 启动前用 node 探针预检：复刻插件的
+     assertHarnessCompatibility 语义（5 个 harness 包版本须一致且落在插件
+     compatibility.json 的 supportedHosts 里），**并扫描插件已发布的 lib 代码
+     判断它是否真的在加载期做断言**，判定分 fatal / risky / ok / unknown。
+     实测 @nanmicoder/dsh-agent-teams 版本同样混杂但不校验（可正常加载）→ 记为
+     risky 不拦截；只有 auto-mode 这类会抛错的才拦。托盘新增"插件兼容检查…"。
+  8. npm 路径全线失效（日志暴露）：本机环境同时有 HTTP_PROXY 与 http_proxy
+     （HTTPS 同理），而 .NET 的 ProcessStartInfo.EnvironmentVariables 是大小写
+     不敏感字典，一访问就抛
+     `已添加项。字典中的关键字:“HTTP_PROXY”所添加的关键字:“http_proxy”`
+     → StartViaNpx / RunNpmCapture / FetchLatestViaNpm 全部静默失败，
+     **npx 启动、"检查更新"、可安装性校验、升级下载都成了摆放**（日志里表现为
+     "可安装性校验 0.1.5-rc.3: 未通过"）。现改为用 npm 命令行开关
+     （--no-fund --no-update-notifier --prefer-offline/--prefer-online），
+     彻底不碰该属性；顺带补掉 FetchLatestViaNpm 里 v0.6.3 漏修的
+     "先 ReadToEnd 再 WaitForExit"（超时形同虚设）。
+
+另外：本次替换/重启过服务时，跳过"浏览器已有页面就不再开"的去重逻辑
+（旧页面已随服务重启失效），直接打开新地址并在托盘提示关旧标签页。
+
+
+四、验证证据（编译在沙箱内被策略禁止，故证据来自实跑与等效移植测试）
+--------------------------------------------------------------------
+1) 自检（DSH_LAUNCHER_SELFTEST=1，只读）：
+     version=0.6.5.0        pnpm=<none>        corepack=…\corepack.cmd
+     port_owner=none pid=0 proc=- title=-      plugins_scanned=3
+     plugin[headless]@nanmicoder/dsh-agent-teams=risky
+     plugin[web]@nanmicoder/dsh-agent-teams=risky
+     plugin[web]@yuxianglin/dsh-bridge-browser=risky
+   → 无 fatal 插件，预检静默放过；C# 对探针输出的解析（判定字段、版本摘要）正确。
+
+2) 真实启动（DSH_LAUNCHER_AUTOSTOP_MS=35000）：
+     01:11:13  启动器开始运行（v0.6.5）
+     01:11:14  插件预检：没有致命插件（第三方插件 3 个…不拦截启动）
+     01:11:14  已直接启动本机 dsh（PID 57000 ← npx 缓存）
+     01:11:20  服务就绪，耗时 6.7 秒
+     01:11:20  SVR> dsh web: http://127.0.0.1:3080/?token=z87JZ…
+     01:11:20  已捕获服务地址（带 token）…          ← bug 3 修复生效
+     01:11:22  已请求打开 DeepSeek 网页: …token=…    ← 用带 token 地址打开
+     01:11:57  自检钩子：自动请求停止 → 01:12:01 干净退出，3080 无残留
+
+3) 插件探针（把 launcher.cs 内嵌的 JS 抽出实跑）：
+     合成 profile（含 auto-mode）→ auto-mode=**fatal**、agent-teams=risky
+     真实 profile（auto-mode 已移除）→ 两个插件均 risky
+   → 致命判定精确到"真的会在加载期抛错的插件"，不误伤能用的插件。
+
+4) 文件级修复逻辑（逐行移植到 JS，在临时副本上跑）：**18/18 断言通过**，
+   覆盖两个边界：补丁文件被全注释后必须补顶层 `[]`；删掉数组末项/唯一项后的
+   悬空逗号清理。JSON 用 JSON.parse、YAML 用 js-yaml 校验。
+
+5) 源码静态检查（跳过注释/字符串的字面量平衡检查）：括号/字符串平衡，无
+   C# 6+ 语法；过程中抓出并修掉一处**真错误**——C# 逐字字符串 @"..." 里的 JS
+   注释混入 ASCII 双引号，会提前闭合字符串导致编译失败。
+
+
+五、文件清单
+------------
+  D:\deepseekhs\dsh-launcher\launcher.cs              启动器源码 v0.6.5
+  D:\deepseekhs\dsh-launcher\build-v065.cmd           构建脚本（**纯 ASCII**）
+  D:\deepseekhs\dsh-launcher\使用说明.txt             更新至 v0.6.5（含第 8 条与 FAQ）
+  D:\deepseekhs\dsh-launcher\launcher-v065.exe        编译产物（01:10）
+  D:\deepseekhs\dsh-launcher\DeepSeek一键启动-v0.6.5.exe  中文名副本（01:10，336 KB）
+  C:\Users\ROG\.dsh\profiles\web\.backup-20260927\    profile 配置原始备份
+
+
+六、坑与约定（重要，别重复踩）
+------------------------------
+  · **.cmd / .bat 必须纯 ASCII**：cmd.exe 按 OEM 代码页（中文系统 GBK/936）读取脚本，
+    UTF-8 的中文注释会被解成乱码并把后续 if/echo 拆坏（实测报一串
+    `'t' 不是内部或外部命令`）。中文只写进 launcher.cs（有 /codepage:65001）
+    或说明 txt；脚本里引用中文文件名请用通配符。
+  · 本机**没有 pnpm**、也没有全局 dsh，所以 `dsh plugin` 系列命令不可用，
+    装/删插件只能改 profile 配置文件。
+  · dsh web 对无 token 请求返回 401；能用的是服务器打印的带 token 地址。
+  · `csc.exe` 在 WorkBuddy 的命令黑名单里（不可授权绕过），编译需用户双击脚本完成。
+  · **别用 DSH_LAUNCHER_AUTOSTOP_MS 在用户开着页面时做验证**：到点会把服务收掉，
+    那个刚打开的标签页立刻变成 Failed to fetch（本轮实际发生过一次）。
+
+
+七、当前状态与待办
+------------------
+  · 磁盘上的 v0.6.5 exe 为 01:10 编译产物，含 bug 1–7 的修复；**尚未包含 bug 8**
+    （npm 环境字典）的修复，需重新双击 `build-v065.cmd`（纯 ASCII 版已就绪）覆盖编译。
+  · 若要恢复 Auto Mode：需把 dsh 运行时降到插件支持的精确版本（0.1.5-rc.2），或等
+    插件作者适配 0.1.5-rc.3；届时把 .backup-20260927\ 里的配置复制回去即可
+    （cordis.patch.yml 中 classifierTimeoutMs: 30000 的定制以注释形式保留着）。
+  · 长期建议：给插件所在的开发检查点（D:\deepseekhs\dsh-auto-mode、dsh-agent-teams）
+    对齐 harness 依赖版本，否则"版本混杂"会一直存在（现被判为 risky，不拦截启动）。
