@@ -10,7 +10,7 @@ Single-file C# · no third-party dependencies · lives in the system tray
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#requirements)
 [![Language: C%23](https://img.shields.io/badge/Language-C%23-239120.svg)](#build)
-[![Release: v0.6.7](https://img.shields.io/github/v/release/DJL606/dsh-launcher?label=Release)](https://github.com/DJL606/dsh-launcher/releases)
+[![Release: v0.7.0](https://img.shields.io/github/v/release/DJL606/dsh-launcher?label=Release)](https://github.com/DJL606/dsh-launcher/releases)
 
 **Language:** [中文](README.md) ｜ **English**
 
@@ -59,16 +59,19 @@ Its point is to catch the "service won't start / page won't open / plugin versio
 
 - **One-click launch** — starts dsh from the npx cache hidden (no `npx` resolution, starts instantly, works offline); opens the browser only once the service is ready, and only one tab.
 - **Tokenized URL** — captures `dsh web: http://127.0.0.1:3080/?token=...` from the server's stdout and uses it to open the page (a bare URL is rejected by token validation).
-- **Tray resident** — double-click the tray icon to reopen the page. The context menu offers:
-  - Open DeepSeek page
-  - **Check dsh / plugin updates…** — a single check-list dialog letting you pick updates per component
-  - Plugin compatibility check…
-  - Switch version (takes effect on restart)
-  - **Stop service and exit** (merges "stop my own service" and "deal with someone else's service")
-- **Update checks** — one automatic check after startup (dialog only when something new exists) plus manual checks from the tray:
-  - dsh itself → downloads the new version in the background; **automatically rolls back** if install/launch fails, so you can never end up "upgraded but unable to open"
-  - Plugins → **file-level install**: `npm pack` → unpack → overwrite into the profile's `node_modules` (whole-directory backup first, rollback-able), no pnpm needed
+- **Control panel (new in v0.7.0)** — the launcher stays in the tray; **double-click the tray icon** (or right-click → Open control panel) to open a system-styled main window with five tabs, so information no longer lives in scattered dialogs:
+  - **Overview** — service state / version / PID / start time / uptime / tokenized URL (one-click copy)
+  - **Updates** — pick dsh and each plugin individually, **one real progress bar per item** (phase · percent · received/total · live speed · elapsed · ETA)
+  - **Plugins** — third-party compatibility table (verdict + declared support, hover for detail), with one-click disable of incompatible plugins
+  - **Log** — live tail of `launcher.log`
+  - **About** — version and paths
+- **Tray menu** — Open control panel / Open DeepSeek page / Check dsh·plugin updates… / Plugin compatibility check… / Switch version (on restart) / (in safe mode) Leave safe mode / **Stop service and exit**
+- **Update checks** — one automatic check after startup (**a single tray balloon, no more interrupting dialog**) plus manual checks from the panel:
+  - dsh itself → downloads in the background with live progress; **automatically rolls back** if install fails
+  - Plugins → **download → SHA1 verify → stage → atomic rename swap** (whole-directory backup first, automatic rollback on failure), no pnpm and no system `tar` required
+  - Downloads **retry and resume**: if the network drops at 98% it continues from the bytes already received
   - `link:`/`file:` specs and symlinked plugins are skipped automatically (local dev packages are left alone)
+- **Safe mode (new in v0.7.0)** — the break-glass path when a plugin or version breaks the service: removes **all** third-party plugins in one click (each profile is fully backed up with its restore source recorded) so the service always starts; the tray menu restores them from that record.
 - **Health self-check** — 6 seconds after launch, validates the client-api path via token → cookie → read-only POST; logs failures and shows a tray balloon.
 - **Exit on shutdown** — closing the whole browser (or stopping from the tray) tears down the service and its process tree, leaving no orphans.
 - **Read-only self-test hook** — `DSH_LAUNCHER_SELFTEST=1` prints a full environment report without touching your real state.
@@ -96,7 +99,7 @@ No installer — download and run. Two options:
 
 **A. Grab the binary (recommended for users)**
 
-Download `launcher-v0.6.7.exe` from [Releases](https://github.com/DJL606/dsh-launcher/releases) and double-click it from any directory. It does **not** need to live in the project folder, and it writes **no files** next to the exe.
+Download `launcher-v0.7.0.exe` from [Releases](https://github.com/DJL606/dsh-launcher/releases) and double-click it from any directory. It does **not** need to live in the project folder, and it writes **no files** next to the exe.
 
 > The exe is not code-signed, so Windows SmartScreen may warn about an unknown publisher. The source and build script are both in this repo, so you can build and verify it yourself.
 
@@ -112,9 +115,10 @@ See [Build](#build) below.
 
 ## Usage
 
-1. Double-click `launcher-v0.6.7.exe`.
+1. Double-click `launcher-v0.7.0.exe`.
 2. Once the service is ready, the dsh page opens in your default browser and a tray icon appears.
-3. To stop: right-click the tray icon → **Stop service and exit** (closing the entire browser also stops it).
+3. To inspect status/updates/plugins/logs: **double-click the tray icon** to open the control panel.
+4. To stop: right-click the tray icon → **Stop service and exit** (closing the entire browser also stops it).
 
 State and logs live in `%LOCALAPPDATA%\DeepSeekLauncher\` — **nothing is written next to the exe**:
 
@@ -131,17 +135,17 @@ The first time you run it on a machine that already has a dsh service, it asks *
 Double-click the build script for the version you want, e.g.:
 
 ```bat
-build-v067.cmd
+build-v070.cmd
 ```
 
-Success shows `csc_exit=0` and produces `launcher-v067.exe`; if `DeepSeek一键启动-v0.6.7.exe` already exists in the folder it is refreshed too.
+Success shows `csc_exit=0` and produces `launcher-v070.exe`; if `DeepSeek一键启动-v0.7.0.exe` already exists in the folder it is refreshed too.
 
 Equivalent manual command:
 
 ```bat
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /optimize+ ^
   /codepage:65001 /utf8output /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
-  /out:launcher-v067.exe launcher.cs
+  /out:launcher-v070.exe launcher.cs
 ```
 
 > Note: every `.cmd` in this folder **must stay pure ASCII**. `cmd.exe` reads scripts using the system OEM code page (GBK/936 on Chinese systems), so UTF-8 Chinese comments turn into garbage and break the following commands.
@@ -154,7 +158,7 @@ Self-test (read-only, does not start the service):
 
 ```bat
 set DSH_LAUNCHER_SELFTEST=1
-launcher-v067.exe
+launcher-v070.exe
 ```
 
 The report is written to `%TEMP%\dsh-launcher-selftest.log` and covers: version, pnpm detection, profile and plugin-compatibility inventory, classification of the process listening on port 3080, update candidates, and the exit-branch decision.
@@ -166,7 +170,17 @@ Other hidden hooks:
 | `DSH_LAUNCHER_PROFILES_ROOT` | Point the profile root elsewhere (for isolated tests) |
 | `DSH_LAUNCHER_REPAIR_TEST` (+`_PLUGIN`/`_ID`) | Exercise the whole "file-level plugin disable" path on a **temporary copy** |
 | `DSH_LAUNCHER_AUTOSTOP_MS` | Automatically run "stop → exit" after N ms, for unattended verification (⚠️ this will stop a running service) |
-| `DSH_LAUNCHER_STATE_FILE` | Redirect the state file (pairs with the self-test so your real state is untouched) |
+| `DSH_LAUNCHER_STATE_FILE` | Redirect the state file (pairs with the self-test so your real state is untouched). Also runs the state-file **corruption self-heal** assertions |
+
+New in v0.7.0 — engine regression hooks (all used together with `DSH_LAUNCHER_SELFTEST=1`, all operating in temp directories):
+
+| Variable | Effect |
+|---|---|
+| `DSH_LAUNCHER_UI_TEST=1` | Build the main window and render every tab to PNG under `%TEMP%\dsh-launcher-ui-shots\` (never shown on screen) |
+| `DSH_LAUNCHER_META_TEST=<pkg>[@ver]` | Query registry metadata to verify tarball URL + SHA1 parsing |
+| `DSH_LAUNCHER_DL_TEST=<url>[;<bytes>]` | Download a URL with progress and assert byte count and progress text |
+| `DSH_LAUNCHER_TAR_TEST=<tgz>[;<files>]` | Unpack a `.tar.gz` with the built-in pure-C# extractor; assert file count and `package.json` version |
+| `DSH_LAUNCHER_ATOMIC_TEST=<profileDir>;<pkg>;<ver>` | Run the full "download → verify → atomic swap → version sync" chain against a **temporary profile copy** |
 
 ## Troubleshooting
 
@@ -175,21 +189,24 @@ Other hidden hooks:
 - **Sending an image says the current model doesn't support images** — a model capability issue, not a bug. Switch to a vision-capable model (e.g. `deepseek-v4-flash-vision-exp`).
 - **Launcher log says `pnpm=<none>`** — pnpm isn't installed, so dsh's `dsh plugin ...` commands are unavailable; the launcher sidesteps this with file-level plugin management.
 - **dsh reports `timed out waiting for the writer lock`** — lock files left over from an unclean exit. Delete `%USERPROFILE%\.dsh\.credentials.yaml.lock` and `settings.yaml.lock`.
+- **A plugin or version broke the service so it won't start** — right-click the tray → Open control panel → **Plugins** → **Enter safe mode** (strips every third-party plugin, backing up each profile first), then "Stop service and exit" and double-click the launcher again; the service will start. To restore, right-click the tray → **Leave safe mode**.
+- **An upgrade/update failed** — each row on the panel's Updates tab shows its own failure reason; a failed plugin update rolls back automatically, and the original directory is kept under `<profile>\.backup-update-<timestamp>\`.
 
 ## Repository layout
 
 ```
 launcher.cs                     Launcher source (single file, no third-party deps)
-build-v067.cmd                  Build script (pure ASCII)
+build-v070.cmd                  Current build script (pure ASCII); older build-v0xx.cmd kept for reproducing old builds
 app.manifest                    DPI-awareness manifest
 使用说明.txt                     User manual (per-version changes and measured results)
-v0.6.7-改动与验证记录.txt        This version's changes + verification evidence + rollback locations
-v0.6.5-修复与验证记录.txt        Previous version's record (8 measured bugs, root causes and fixes)
+v0.7.0-改动与验证记录.txt        This version's changes + verification evidence + rollback locations
+v0.6.7-改动与验证记录.txt        Previous version's record
+v0.6.5-修复与验证记录.txt        Older record (8 measured bugs, root causes and fixes)
 LICENSE                         Full official CC BY-NC 4.0 text
 README-en.md                    This file (English)
 ```
 
-> Release assets use ASCII names (e.g. `launcher-v0.6.7.exe`, `USAGE-zh-CN.txt`) because GitHub strips non-ASCII characters from asset names — so asset names don't map one-to-one onto the file names above. See the [Releases page](https://github.com/DJL606/dsh-launcher/releases) for the mapping.
+> Release assets use ASCII names (e.g. `launcher-v0.7.0.exe`, `USAGE-zh-CN.txt`) because GitHub strips non-ASCII characters from asset names — so asset names don't map one-to-one onto the file names above. See the [Releases page](https://github.com/DJL606/dsh-launcher/releases) for the mapping.
 
 ## License
 

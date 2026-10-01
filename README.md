@@ -64,16 +64,19 @@ dsh 本身是个强大的 Agent 运行时，但日常用起来有几类"看起�
 
 - **一键启动**：隐藏启动 npx 缓存里的 dsh（不经 npx 解析，秒起、离线可用），服务就绪后才打开浏览器，只开一个标签页
 - **带 token 的地址**：抓服务器 stdout 里 `dsh web: http://127.0.0.1:3080/?token=...` 的地址用于打开页面（裸地址会被 token 校验拒绝）
-- **托盘常驻**：双击托盘图标重开页面；右键菜单包含
-  - 打开 DeepSeek 网页
-  - **检查 dsh / 插件更新…** —— 一张勾选菜单，dsh 本体与各插件逐项选择是否更新
-  - 插件兼容检查…
-  - 切换版本（重启生效）
-  - **停止服务并退出**（合并了"停自有服务"与"处理别人的服务"两种情况）
-- **更新检查**：启动后自动检查一次（仅在有新版本时弹窗）+ 托盘手动检查
-  - dsh 本体 → 后台下载新版本，安装/启动失败**自动回退**，绝不会"升级失败又打不开"
-  - 插件 → **文件级安装**：`npm pack` 下载 → 解包 → 覆盖到 profile 的 `node_modules`（先整目录备份，可回滚），无需 pnpm
+- **控制面板（v0.7.0 新增）**：托盘常驻，**双击托盘图标**（或右键 → 打开控制面板）打开一个系统风格的主窗口，分 5 个页签，信息不再散落在各处弹窗里：
+  - **概览** —— 服务状态 / 使用版本 / PID / 启动时间 / 运行时长 / 带 token 地址（一键复制）
+  - **更新** —— dsh 本体与各插件逐项勾选，**每项一条真实进度条**（阶段 · 百分比 · 已下载/总量 · 实时速度 · 已用时间 · 预计剩余）
+  - **插件** —— 第三方插件兼容性表格（判定 + 声明支持，悬停看完整说明），可一键禁用不兼容插件
+  - **日志** —— 实时查看 `launcher.log`
+  - **关于** —— 版本与各项路径
+- **托盘菜单**：打开控制面板 / 打开 DeepSeek 网页 / 检查 dsh·插件更新… / 插件兼容检查… / 切换版本（重启生效）/（安全模式时）退出安全模式 / **停止服务并退出**（合并了"停自有服务"与"处理别人的服务"两种情况）
+- **更新检查**：启动后自动检查一次（**只发一条气泡，不再弹窗打断**）+ 面板手动检查
+  - dsh 本体 → 后台下载安装并实时显示进度，失败**自动回退**，绝不会"升级失败又打不开"
+  - 插件 → **下载 → SHA1 校验 → staging 拼装 → rename 原子换入**（改前整目录备份，失败自动回滚），无需 pnpm，也不依赖系统 `tar`
+  - 下载**支持重试与断点续传**：网络在 98% 处断掉也能从已收到的字节接着下
   - 自动跳过 `link:`/`file:` 规格与符号链接型插件（本地开发包不动）
+- **安全模式（v0.7.0 新增）**：插件/版本把服务改坏时的"破窗"通道 —— 一键摘除**全部**第三方插件（每个 profile 先整份备份并记录还原来源），保证服务一定起得来；托盘"退出安全模式"按记录一键还原
 - **健康自检**：启动后 6 秒用 token→cookie→POST 只读接口验证 client-api 通路，失败留日志 + 气泡
 - **停机即退**：关闭整个浏览器（或托盘停止）时自动收掉服务及其进程树，不留孤儿
 - **只读自检钩子**：`DSH_LAUNCHER_SELFTEST=1` 输出完整环境体检报告，不动你的真实状态
@@ -101,7 +104,7 @@ dsh 本身是个强大的 Agent 运行时，但日常用起来有几类"看起�
 
 **A. 直接下二进制（推荐给使用者）**
 
-到 [Releases](https://github.com/DJL606/dsh-launcher/releases) 下载 `launcher-v0.6.7.exe`，放到任意目录双击即可。**不需要**放到项目目录里，也不会在 exe 所在目录生成任何文件。
+到 [Releases](https://github.com/DJL606/dsh-launcher/releases) 下载 `launcher-v0.7.0.exe`，放到任意目录双击即可。**不需要**放到项目目录里，也不会在 exe 所在目录生成任何文件。
 
 > 该 exe 未做代码签名，Windows SmartScreen 可能提示"未知发布者"；源码与构建脚本都在本仓库，可自行编译核对。
 
@@ -117,9 +120,10 @@ dsh 本身是个强大的 Agent 运行时，但日常用起来有几类"看起�
 
 ## 使用
 
-1. 双击 `launcher-v0.6.7.exe`
+1. 双击 `launcher-v0.7.0.exe`
 2. 服务就绪后会自动用默认浏览器打开 dsh 页面；托盘出现图标
-3. 结束时：右键托盘 → **停止服务并退出**（关掉整个浏览器也会自动停止）
+3. 需要看状态/更新/插件/日志时：**双击托盘图标**打开控制面板
+4. 结束时：右键托盘 → **停止服务并退出**（关掉整个浏览器也会自动停止）
 
 状态与日志都在 `%LOCALAPPDATA%\DeepSeekLauncher\`，**不在 exe 所在目录生成任何文件**：
 
@@ -136,17 +140,17 @@ dsh 本身是个强大的 Agent 运行时，但日常用起来有几类"看起�
 双击对应版本的构建脚本，例如：
 
 ```bat
-build-v067.cmd
+build-v070.cmd
 ```
 
-窗口里出现 `csc_exit=0` 即成功，产出 `launcher-v067.exe`；若目录里已存在 `DeepSeek一键启动-v0.6.7.exe` 会一并刷新。
+窗口里出现 `csc_exit=0` 即成功，产出 `launcher-v070.exe`；若目录里已存在 `DeepSeek一键启动-v0.7.0.exe` 会一并刷新。
 
 等价的手工命令：
 
 ```bat
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /optimize+ ^
   /codepage:65001 /utf8output /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
-  /out:launcher-v067.exe launcher.cs
+  /out:launcher-v070.exe launcher.cs
 ```
 
 > 注意：本目录下所有 `.cmd` **必须保持纯 ASCII**。`cmd.exe` 按系统 OEM 代码页（中文系统 GBK/936）读取脚本，UTF-8 的中文注释会被解成乱码并把后续命令拆坏。
@@ -159,7 +163,7 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /
 
 ```bat
 set DSH_LAUNCHER_SELFTEST=1
-launcher-v067.exe
+launcher-v070.exe
 ```
 
 报告写在 `%TEMP%\dsh-launcher-selftest.log`，包含：版本、pnpm 检测、profile 与插件兼容清单、3080 端口占用者分类、更新候选、退出分支判定等。
@@ -171,7 +175,17 @@ launcher-v067.exe
 | `DSH_LAUNCHER_PROFILES_ROOT` | 把 profile 根目录指到别处（隔离测试用） |
 | `DSH_LAUNCHER_REPAIR_TEST` (+`_PLUGIN`/`_ID`) | 在**临时副本**上验证"文件级禁用插件"整条路径 |
 | `DSH_LAUNCHER_AUTOSTOP_MS` | 到点自动走"停止 → 退出"，用于无人值守验证（⚠️ 会停掉正在跑的服务） |
-| `DSH_LAUNCHER_STATE_FILE` | 把状态文件重定向（配合自检，不碰真实状态） |
+| `DSH_LAUNCHER_STATE_FILE` | 把状态文件重定向（配合自检，不碰真实状态）。同时会跑状态文件**损坏自愈**断言 |
+
+v0.7.0 新增的引擎回归钩子（都配合 `DSH_LAUNCHER_SELFTEST=1`，全部在临时目录操作）：
+
+| 变量 | 作用 |
+|---|---|
+| `DSH_LAUNCHER_UI_TEST=1` | 构造主窗口 + 逐页签渲染 PNG 到 `%TEMP%\dsh-launcher-ui-shots\`（不显示在屏幕上） |
+| `DSH_LAUNCHER_META_TEST=<pkg>[@ver]` | 查 registry 元数据，验证 tarball 直链与 SHA1 的解析 |
+| `DSH_LAUNCHER_DL_TEST=<url>[;<bytes>]` | 带进度下载一个 URL，断言字节数与进度文本 |
+| `DSH_LAUNCHER_TAR_TEST=<tgz>[;<files>]` | 用内置纯 C# 解包器解 `.tar.gz`，断言文件数与 `package.json` 版本 |
+| `DSH_LAUNCHER_ATOMIC_TEST=<profileDir>;<pkg>;<ver>` | 用**临时 profile 副本**跑通"下载→校验→原子替换→同步版本"整条链路 |
 
 ## 排障速查
 
@@ -180,21 +194,24 @@ launcher-v067.exe
 - **发图片提示"当前模型不支持图片"**：模型能力问题，不是故障 —— 切到支持视觉的模型（如 `deepseek-v4-flash-vision-exp`）。
 - **启动器日志里 `pnpm=<none>`**：本机没装 pnpm，所以 dsh 的 `dsh plugin ...` 命令不可用 —— 本启动器改用文件级插件管理绕开它。
 - **dsh 报 `timed out waiting for the writer lock`**：上次异常退出残留的锁文件。删掉 `%USERPROFILE%\.dsh\.credentials.yaml.lock` 与 `settings.yaml.lock` 即可。
+- **插件/版本把服务改坏了，起不来**：右键托盘 → 打开控制面板 → **插件** → **进入安全模式**（摘除全部第三方插件，每个 profile 先备份），然后"停止服务并退出"再双击启动器，服务一定能起来；要恢复时右键托盘 → **退出安全模式**。
+- **升级/更新失败**：面板"更新"页每一行都会显示失败原因；插件更新失败会自动回滚到原版本，原目录备份在 `<profile>\.backup-update-<时间戳>\`。
 
 ## 仓库结构
 
 ```
 launcher.cs                     启动器源码（单文件，无第三方依赖）
-build-v067.cmd                  构建脚本（纯 ASCII）
+build-v070.cmd                  当前版构建脚本（纯 ASCII）；build-v067.cmd 等旧脚本保留可复现旧版
 app.manifest                    DPI 感知清单
 使用说明.txt                     用户手册（按版本记录每一项改动与实测结果）
-v0.6.7-改动与验证记录.txt        本版改动 + 验证证据 + 备份/回滚位置
-v0.6.5-修复与验证记录.txt        上一版记录（含 8 个实测 bug 的定位与修法）
+v0.7.0-改动与验证记录.txt        本版改动 + 验证证据 + 备份/回滚位置
+v0.6.7-改动与验证记录.txt        上一版记录
+v0.6.5-修复与验证记录.txt        更早一版记录（含 8 个实测 bug 的定位与修法）
 LICENSE                         CC BY-NC 4.0 官方全文
 README-en.md                    英文版说明（English-only copy）
 ```
 
-> Release 里的资产名统一用 ASCII（如 `launcher-v0.6.7.exe`、`USAGE-zh-CN.txt`）：GitHub 会把 Release 资产名里的中文清洗掉，所以附件的命名与仓库内文件名不完全对应，对照表见 [Release 页面](https://github.com/DJL606/dsh-launcher/releases)。
+> Release 里的资产名统一用 ASCII（如 `launcher-v0.7.0.exe`、`USAGE-zh-CN.txt`）：GitHub 会把 Release 资产名里的中文清洗掉，所以附件的命名与仓库内文件名不完全对应，对照表见 [Release 页面](https://github.com/DJL606/dsh-launcher/releases)。
 
 ## 许可
 
@@ -250,16 +267,19 @@ Its point is to catch the "service won't start / page won't open / plugin versio
 
 - **One-click launch** — starts dsh from the npx cache hidden (no `npx` resolution, starts instantly, works offline); opens the browser only once the service is ready, and only one tab.
 - **Tokenized URL** — captures `dsh web: http://127.0.0.1:3080/?token=...` from the server's stdout and uses it to open the page (a bare URL is rejected by token validation).
-- **Tray resident** — double-click the tray icon to reopen the page. The context menu offers:
-  - Open DeepSeek page
-  - **Check dsh / plugin updates…** — a single check-list dialog letting you pick updates per component
-  - Plugin compatibility check…
-  - Switch version (takes effect on restart)
-  - **Stop service and exit** (merges "stop my own service" and "deal with someone else's service")
-- **Update checks** — one automatic check after startup (dialog only when something new exists) plus manual checks from the tray:
-  - dsh itself → downloads the new version in the background; **automatically rolls back** if install/launch fails, so you can never end up "upgraded but unable to open"
-  - Plugins → **file-level install**: `npm pack` → unpack → overwrite into the profile's `node_modules` (whole-directory backup first, rollback-able), no pnpm needed
+- **Control panel (new in v0.7.0)** — the launcher stays in the tray; **double-click the tray icon** (or right-click → Open control panel) to open a system-styled main window with five tabs, so information no longer lives in scattered dialogs:
+  - **Overview** — service state / version / PID / start time / uptime / tokenized URL (one-click copy)
+  - **Updates** — pick dsh and each plugin individually, **one real progress bar per item** (phase · percent · received/total · live speed · elapsed · ETA)
+  - **Plugins** — third-party compatibility table (verdict + declared support, hover for detail), with one-click disable of incompatible plugins
+  - **Log** — live tail of `launcher.log`
+  - **About** — version and paths
+- **Tray menu** — Open control panel / Open DeepSeek page / Check dsh·plugin updates… / Plugin compatibility check… / Switch version (on restart) / (in safe mode) Leave safe mode / **Stop service and exit**
+- **Update checks** — one automatic check after startup (**a single tray balloon, no more interrupting dialog**) plus manual checks from the panel:
+  - dsh itself → downloads in the background with live progress; **automatically rolls back** if install fails
+  - Plugins → **download → SHA1 verify → stage → atomic rename swap** (whole-directory backup first, automatic rollback on failure), no pnpm and no system `tar` required
+  - Downloads **retry and resume**: if the network drops at 98% it continues from the bytes already received
   - `link:`/`file:` specs and symlinked plugins are skipped automatically (local dev packages are left alone)
+- **Safe mode (new in v0.7.0)** — the break-glass path when a plugin or version breaks the service: removes **all** third-party plugins in one click (each profile is fully backed up with its restore source recorded) so the service always starts; the tray menu restores them from that record.
 - **Health self-check** — 6 seconds after launch, validates the client-api path via token → cookie → read-only POST; logs failures and shows a tray balloon.
 - **Exit on shutdown** — closing the whole browser (or stopping from the tray) tears down the service and its process tree, leaving no orphans.
 - **Read-only self-test hook** — `DSH_LAUNCHER_SELFTEST=1` prints a full environment report without touching your real state.

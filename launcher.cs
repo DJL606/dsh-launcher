@@ -113,6 +113,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -122,9 +123,9 @@ using Microsoft.Win32;
     [assembly: System.Reflection.AssemblyTitle("DeepSeek 一键启动器")]
 [assembly: System.Reflection.AssemblyProduct("DeepSeek 一键启动器")]
 [assembly: System.Reflection.AssemblyDescription("直接启动本机已装的 dsh，自动打开网页，关闭浏览器或托盘操作时自动停止服务；启动时检查新版本并在确认可安装后询问是否升级")]
-[assembly: System.Reflection.AssemblyVersion("0.6.7.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.6.7.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("v0.6.7")]
+[assembly: System.Reflection.AssemblyVersion("0.7.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.7.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("v0.7.0")]
 
 internal static class DshLauncher
 {
@@ -134,6 +135,8 @@ internal static class DshLauncher
     private const int ReadyTimeoutSec = 180;
     private const string ExeName = "DeepSeek一键启动";
     private const string TrayResource = "dsh_app.ico";
+    // v0.7.0：本启动器版本（日志、User-Agent、下载器统一引用这里，避免多处硬编码漂移）
+    private const string LauncherVersion = "0.7.0";
 
     private static volatile bool stopRequested;
     private static NotifyIcon trayIcon;
@@ -165,6 +168,17 @@ internal static class DshLauncher
         try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
         uiThreadId = Thread.CurrentThread.ManagedThreadId;
 
+        // v0.7.0：全局异常兜底 —— 任何未处理异常都先落日志再决定是否退出，
+        // 绝不出现“双击后一闪而过、什么证据都没留下”的崩溃。
+        Application.ThreadException += delegate (object s, System.Threading.ThreadExceptionEventArgs e)
+        {
+            Log("未处理的 UI 线程异常: " + e.Exception);
+        };
+        AppDomain.CurrentDomain.UnhandledException += delegate (object s, UnhandledExceptionEventArgs e)
+        {
+            Log("未处理的应用域异常: " + e.ExceptionObject);
+        };
+
         // 自检专用：把状态文件重定向到临时路径（仅在自检模式下生效），
         // 这样"服务记录"的读写与判定可以在不碰用户真实 version.txt 的情况下被验证。
         if (Environment.GetEnvironmentVariable("DSH_LAUNCHER_SELFTEST") == "1")
@@ -175,6 +189,7 @@ internal static class DshLauncher
 
         EnsureAppDataDir();
         MigrateLegacyState();
+        PruneBackups(8);   // v0.7.0：只清理插件更新自动产生的备份，保留最近 8 份
 
         // 自检模式：无托盘、无浏览器、无服务器等副作用
         if (Environment.GetEnvironmentVariable("DSH_LAUNCHER_SELFTEST") == "1")
@@ -190,7 +205,7 @@ internal static class DshLauncher
             return 0;
         }
 
-        Log("=== 启动器开始运行（v0.6.7）===");
+        Log("=== 启动器开始运行（v" + LauncherVersion + "）===");
         return Run();
     }
 
@@ -511,6 +526,11 @@ internal static class DshLauncher
         // 5. 收尾
         Log("停止原因: " + (stopReason ?? "未知"));
         HideTrayIcon();
+        if (mainForm != null && !mainForm.IsDisposed)
+        {
+            try { mainForm.Dispose(); } catch { }
+            mainForm = null;
+        }
         if (activeNpmProcess != null && !activeNpmProcess.HasExited) KillProcessTree(activeNpmProcess);
         if (server != null)
         {
@@ -1065,15 +1085,19 @@ internal static class DshLauncher
         try
         {
             var menu = new ContextMenuStrip();
+            // v0.7.0：控制面板是新的主入口，放在第一项；双击托盘图标也会打开它。
+            var panelItem = new ToolStripMenuItem("打开控制面板");
+            panelItem.Font = new Font(panelItem.Font, FontStyle.Bold);
+            panelItem.Click += delegate { ShowMainWindow(); };
             var openItem = new ToolStripMenuItem("打开 DeepSeek 网页");
             openItem.Click += delegate { OpenUrl(); };
             // v0.6.7：更新检查合并成一张勾选菜单（dsh 本体 + 各 profile 的第三方插件），
-            // 一项一项都能单独选择是否更新。
+            // v0.7.0：改为直接打开控制面板的“更新”页（界面里逐项进度条，不再是黑盒弹窗）。
             var updateItem = new ToolStripMenuItem("检查 dsh / 插件更新…");
-            updateItem.Click += delegate { CheckUpdatesFromTray(); };
+            updateItem.Click += delegate { ShowMainWindowUpdates(); };
             // v0.6.5：插件与 dsh 版本错配是"服务起不来"的头号原因，给个随时可查的入口
             var pluginItem = new ToolStripMenuItem("插件兼容检查…");
-            pluginItem.Click += delegate { CheckPluginsFromTray(); };
+            pluginItem.Click += delegate { ShowMainWindow(); ShowMainWindowPlugins(); };
             // 回退通道：插件与 dsh 版本互相挑剔时，一键切回缓存里已装好的其他版本
             var versionItem = new ToolStripMenuItem("切换版本（重启生效）");
             versionItem.DropDownOpening += delegate { RebuildVersionMenu(versionItem); };
@@ -1082,10 +1106,17 @@ internal static class DshLauncher
             // 点错就会留下一个没人管的服务。现在由 ExitWithServiceHandling 一次判断清楚。
             var stopItem = new ToolStripMenuItem("停止服务并退出");
             stopItem.Click += delegate { ExitWithServiceHandling(); };
+            menu.Items.Add(panelItem);
             menu.Items.Add(openItem);
             menu.Items.Add(updateItem);
             menu.Items.Add(pluginItem);
             menu.Items.Add(versionItem);
+            if (IsSafeMode())
+            {
+                var exitSafe = new ToolStripMenuItem("退出安全模式（还原被摘除的插件）");
+                exitSafe.Click += delegate { ExitSafeModeUi(); };
+                menu.Items.Add(exitSafe);
+            }
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(stopItem);
 
@@ -1096,7 +1127,8 @@ internal static class DshLauncher
                 Visible = true,
                 ContextMenuStrip = menu
             };
-            trayIcon.DoubleClick += delegate { OpenUrl(); };
+            // v0.7.0：双击托盘 = 打开控制面板（原先是直接开网页，改由面板里的按钮承担）
+            trayIcon.DoubleClick += delegate { ShowMainWindow(); };
         }
         catch
         {
@@ -1341,6 +1373,15 @@ internal static class DshLauncher
             if (Verdict == "unknown") return "无法判定（" + (Note ?? "探测失败") + "）";
             return "兼容";
         }
+
+        /// <summary>表格列里用的短判定（长句在 ListView 列里会被截断）。</summary>
+        public string VerdictShort()
+        {
+            if (Verdict == "fatal") return "致命（服务起不来）";
+            if (Verdict == "risky") return "版本混杂（能跑）";
+            if (Verdict == "unknown") return "未知";
+            return "兼容";
+        }
     }
 
     /// <summary>
@@ -1582,35 +1623,7 @@ internal static class DshLauncher
     /// <summary>托盘"插件兼容检查…"：列出所有第三方插件的兼容判定，可一键禁用。</summary>
     private static void CheckPluginsFromTray()
     {
-        SetTrayText("正在检查插件兼容性…");
-        List<PluginCompat> all;
-        try { all = ScanProfilePlugins(); }
-        finally { SetTrayText("DeepSeek Harness 服务运行中（右键可停止）"); }
-
-        var bad = new List<PluginCompat>();
-        foreach (var p in all)
-        {
-            if (p.Fatal) bad.Add(p);
-        }
-        string report = PluginReportText(all);
-
-        if (bad.Count == 0)
-        {
-            Msg("插件兼容检查\n\n" + report, MessageBoxIcon.Information);
-            return;
-        }
-        var r = MessageBox.Show(
-            "插件兼容检查\n\n" + report +
-            "\n这些插件在服务启动时会直接抛错，导致服务起不来。\n" +
-            "是否现在禁用它们？（禁用后请用托盘“停止服务并退出”，再重新启动即生效）",
-            AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button1);
-        if (r != DialogResult.Yes) return;
-
-        var rep = new StringBuilder();
-        foreach (var p in bad) rep.AppendLine(DisablePluginEverywhere(p.Name, null));
-        Log("托盘检查：已禁用不兼容插件" + Environment.NewLine + rep.ToString());
-        Msg("已禁用 " + bad.Count + " 个不兼容插件。\n\n" + rep.ToString() +
-            "\n请托盘右键 → 停止服务并退出，再重新双击启动器。", MessageBoxIcon.Information);
+        ShowMainWindowPlugins();
     }
 
     /// <summary>
@@ -2137,37 +2150,67 @@ try {
         try
         {
             if (!File.Exists(VersionFile)) return;
-            foreach (string line in File.ReadAllLines(VersionFile))
+            int parsed = ParseStateLines(File.ReadAllLines(VersionFile),
+                ref version, ref declined, ref checkedAt, ref pending);
+            // v0.7.0 自愈：文件在、却一个已知键都没解析出来（写坏/被清空/被截断）
+            // → 用 WriteVersionState 留下的 .bak 救回，避免“状态丢了就再也认不出自己的服务”。
+            if (parsed == 0)
             {
-                int eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                string val = line.Substring(eq + 1).Trim();
-                if (key == "version") version = val;
-                else if (key == "declined") declined = val;
-                else if (key == "pending") pending = val;
-                else if (key == "checked")
+                string bak = VersionFile + ".bak";
+                if (File.Exists(bak))
                 {
-                    DateTime t;
-                    if (DateTime.TryParse(val, out t)) checkedAt = t;
+                    Log("状态文件疑似损坏，尝试从备份恢复：" + bak);
+                    int parsedBak = ParseStateLines(File.ReadAllLines(bak),
+                        ref version, ref declined, ref checkedAt, ref pending);
+                    if (parsedBak > 0)
+                    {
+                        try { File.Copy(bak, VersionFile, true); } catch { }
+                        Log("已从备份恢复状态文件（解析到 " + parsedBak + " 项）");
+                    }
                 }
-                else if (key == "service_pid")
-                {
-                    int p;
-                    if (int.TryParse(val, out p)) servicePid = p;
-                }
-                else if (key == "service_start")
-                {
-                    DateTime t;
-                    if (DateTime.TryParse(val, out t)) serviceStartedAt = t;
-                }
-                else if (key == "service_version") serviceVersion = val;
             }
         }
         catch (Exception ex)
         {
             Log("版本状态读取失败: " + ex.Message);
         }
+    }
+
+    /// <summary>解析状态文件的若干行；返回解析到的已知键数量（0 = 文件损坏或为空）。</summary>
+    private static int ParseStateLines(string[] lines, ref string version, ref string declined,
+        ref DateTime checkedAt, ref string pending)
+    {
+        int parsed = 0;
+        foreach (string line in lines)
+        {
+            int eq = line.IndexOf('=');
+            if (eq <= 0) continue;
+            string key = line.Substring(0, eq).Trim().ToLowerInvariant();
+            string val = line.Substring(eq + 1).Trim();
+            if (key == "version") { version = val; parsed++; }
+            else if (key == "declined") { declined = val; parsed++; }
+            else if (key == "pending") { pending = val; parsed++; }
+            else if (key == "checked")
+            {
+                DateTime t;
+                if (DateTime.TryParse(val, out t)) checkedAt = t;
+                parsed++;
+            }
+            else if (key == "service_pid")
+            {
+                int p;
+                if (int.TryParse(val, out p)) servicePid = p;
+                parsed++;
+            }
+            else if (key == "service_start")
+            {
+                DateTime t;
+                if (DateTime.TryParse(val, out t)) serviceStartedAt = t;
+                parsed++;
+            }
+            else if (key == "service_version") { serviceVersion = val; parsed++; }
+        }
+        return parsed;
     }
 
     private static void WriteVersionState(string version, string declined, DateTime checkedAt)
@@ -2196,7 +2239,25 @@ try {
                 if (!string.IsNullOrEmpty(serviceVersion))
                     sb.AppendLine("service_version=" + serviceVersion);
             }
-            File.WriteAllText(VersionFile, sb.ToString());
+            // v0.7.0：原子写 —— 先写 .tmp，再替换，并把旧文件留成 .bak。
+            // 这样“写到一半断电/被杀”不会留下半截文件（半截文件会让启动器认不出自己的服务）。
+            string text = sb.ToString();
+            string tmp = VersionFile + ".tmp";
+            File.WriteAllText(tmp, text, new UTF8Encoding(false));
+            if (File.Exists(VersionFile))
+            {
+                try { File.Replace(tmp, VersionFile, VersionFile + ".bak"); }
+                catch
+                {
+                    // 某些文件系统不支持 Replace → 退化为覆盖 + 删除临时文件
+                    try { File.Copy(tmp, VersionFile, true); } catch { }
+                    try { File.Delete(tmp); } catch { }
+                }
+            }
+            else
+            {
+                File.Move(tmp, VersionFile);
+            }
         }
         catch (Exception ex)
         {
@@ -3059,122 +3120,10 @@ try {
         return version;
     }
 
-    /// <summary>
-    /// 勾选菜单：把可更新项列出来，每项可单独勾选，确认后逐个执行。
-    /// 返回用户选中的项（取消 = 空表）。
-    /// </summary>
-    private static List<UpdateCandidate> ShowUpdatePicker(List<UpdateCandidate> items)
-    {
-        var chosen = new List<UpdateCandidate>();
-        // 对话框必须在真正的 UI 消息循环里跑（否则会在后台线程上开窗，行为不可靠）。
-        // 启动阶段还没进消息循环时，宁可跳过本次弹窗 —— 下次启动或托盘入口仍可检查。
-        if (!uiLoopRunning)
-        {
-            Log("更新菜单：UI 消息循环尚未运行，跳过本次弹窗");
-            return chosen;
-        }
-        // 弹窗必须在 UI 线程；这里可能在后台线程被调用，用 Ui() 回投并等待结果。
-        var done = new ManualResetEvent(false);
-        Ui(delegate
-        {
-            try
-            {
-                var form = new Form();
-                form.Text = AppTitle + " — 更新检查";
-                form.FormBorderStyle = FormBorderStyle.FixedDialog;
-                form.StartPosition = FormStartPosition.CenterScreen;
-                form.MinimizeBox = false;
-                form.MaximizeBox = false;
-                form.ClientSize = new Size(560, 320);
-
-                var tip = new Label();
-                tip.Text = "勾选要更新的项目（默认全选）：";
-                tip.SetBounds(12, 10, 520, 20);
-                form.Controls.Add(tip);
-
-                var list = new CheckedListBox();
-                list.CheckOnClick = true;
-                list.SetBounds(12, 34, 536, 230);
-                foreach (var it in items) list.Items.Add(it.Line(), true);
-                form.Controls.Add(list);
-
-                var note = new Label();
-                note.Text = "说明：dsh 本体升级会在后台下载（失败自动回退）；插件更新为文件级安装，"
-                    + "\n会先整目录备份再覆盖，不依赖 pnpm。更新后需重启启动器生效。";
-                note.SetBounds(12, 268, 536, 32);
-                form.Controls.Add(note);
-
-                var ok = new Button();
-                ok.Text = "更新选中项";
-                ok.SetBounds(360, 296, 100, 26);
-                ok.Click += delegate
-                {
-                    foreach (object obj in list.CheckedItems)
-                    {
-                        int idx = list.Items.IndexOf(obj);
-                        if (idx >= 0 && idx < items.Count) chosen.Add(items[idx]);
-                    }
-                    form.DialogResult = DialogResult.OK;
-                    form.Close();
-                };
-                form.Controls.Add(ok);
-
-                var cancel = new Button();
-                cancel.Text = "暂不更新";
-                cancel.SetBounds(466, 296, 82, 26);
-                cancel.Click += delegate { form.DialogResult = DialogResult.Cancel; form.Close(); };
-                form.Controls.Add(cancel);
-
-                form.AcceptButton = ok;
-                form.CancelButton = cancel;
-                form.ShowDialog();
-            }
-            catch (Exception ex)
-            {
-                Log("更新菜单显示失败: " + ex.Message);
-            }
-            finally
-            {
-                done.Set();
-            }
-        });
-        done.WaitOne(TimeSpan.FromMinutes(10));
-        return chosen;
-    }
-
     /// <summary>托盘"检查 dsh / 插件更新…"：与启动时自动检查共用同一套收集与界面。</summary>
     private static void CheckUpdatesFromTray()
     {
-        if (upgradeRunning != 0)
-        {
-            Msg("已经有一个更新正在执行中，请等它结束。\n\n进度显示在托盘提示上。", MessageBoxIcon.Information);
-            return;
-        }
-        string running = string.IsNullOrEmpty(pinnedVersion) ? "未记录" : pinnedVersion;
-        SetTrayText("正在检查 dsh / 插件更新…");
-        List<UpdateCandidate> items = CollectUpdateCandidates();
-        SetTrayText("DeepSeek Harness 服务运行中（右键可停止）");
-
-        if (items == null)
-        {
-            Msg("检查更新失败：无法访问 npm 仓库，请检查网络连接。\n\n当前 dsh 版本：" + running,
-                MessageBoxIcon.Warning);
-            return;
-        }
-        if (items.Count == 0)
-        {
-            string extra = "";
-            if (skippedPluginUpdates.Count > 0)
-            {
-                extra = "\n\n有以下插件新版本因与当前 dsh 不兼容而未被列入：\n· "
-                    + string.Join("\n· ", skippedPluginUpdates.ToArray());
-            }
-            Msg("已是最新。\n\n· dsh 本体：" + running +
-                "\n· 第三方插件：没有可用的新版本\n\n（检查通道：npm latest；本地 link/链接型插件不参与）" + extra,
-                MessageBoxIcon.Information);
-            return;
-        }
-        ApplyUpdates(ShowUpdatePicker(items));
+        ShowMainWindowUpdates();
     }
 
     /// <summary>启动后的后台自动检查：只在确实有新版本时弹一次勾选菜单。</summary>
@@ -3204,7 +3153,15 @@ try {
                 }
                 if (items.Count == 0) { Log("启动更新检查：仅 dsh 有新版（本次已询问过）"); return; }
                 Log("启动更新检查：发现 " + items.Count + " 项可更新");
-                ApplyUpdates(ShowUpdatePicker(items));
+                // v0.7.0：不再用对话框打断启动 —— 只发一条气泡，由用户自己决定何时更新；
+                // 控制面板若已打开，顺手刷新出列表。
+                Balloon("发现 " + items.Count + " 项可更新（dsh / 插件）。\n双击托盘图标打开控制面板查看详情。",
+                    ToolTipIcon.Info);
+                Ui(delegate
+                {
+                    try { if (mainForm != null && mainForm.Visible) mainForm.RefreshUpdates(); }
+                    catch { }
+                });
             }
             catch (Exception ex)
             {
@@ -3213,115 +3170,6 @@ try {
         });
         t.IsBackground = true;
         t.Start();
-    }
-
-    /// <summary>执行用户勾选的更新（dsh 走既有下载流程，插件走文件级安装）。</summary>
-    private static void ApplyUpdates(List<UpdateCandidate> chosen)
-    {
-        if (chosen == null || chosen.Count == 0)
-        {
-            Log("更新检查：用户未选择任何项目");
-            return;
-        }
-        var okList = new List<string>();
-        var failList = new List<string>();
-        string dshTarget = null;
-
-        foreach (var it in chosen)
-        {
-            if (it.Kind == "dsh") { dshTarget = it.Latest; continue; }
-            SetTrayText("正在更新插件 " + it.Package + " → " + it.Latest + "…");
-            string err = UpdatePluginFile(it.ProfileDir, it.Package, it.Latest);
-            if (err == null) okList.Add(it.Label + " → " + it.Latest);
-            else failList.Add(it.Label + " → " + it.Latest + "（" + err + "）");
-        }
-        SetTrayText("DeepSeek Harness 服务运行中（右键可停止）");
-
-        if (dshTarget != null)
-        {
-            Log("更新检查：选择升级 dsh → " + dshTarget);
-            WriteVersionState(pinnedVersion, null, DateTime.Now, dshTarget);
-            BeginUpgradeInstall(dshTarget);
-        }
-
-        var sb = new StringBuilder();
-        if (dshTarget != null)
-            sb.AppendLine("· dsh 本体：" + pinnedVersion + " → " + dshTarget + "（后台下载中，失败自动回退）");
-        foreach (string s in okList) sb.AppendLine("· 插件已更新：" + s);
-        foreach (string s in failList) sb.AppendLine("· 插件更新失败：" + s);
-        if (okList.Count > 0 || dshTarget != null)
-            sb.AppendLine("\n重启启动器（托盘 → 停止服务并退出，再双击）后生效。");
-        if (failList.Count > 0)
-            sb.AppendLine("\n失败项的失败原因见日志；插件目录在覆盖前已整目录备份，可回滚。");
-        Msg(sb.ToString().TrimEnd(), failList.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
-    }
-
-    /// <summary>
-    /// 文件级插件更新（不需要 pnpm）：
-    ///   ① 把现有插件目录整份备份到 &lt;profile&gt;\.backup-update-&lt;时间戳&gt;\
-    ///   ② npm pack 下载新版本到 %TEMP%，用系统自带 tar 解包
-    ///   ③ 覆盖到 &lt;profile&gt;\node_modules\&lt;包名&gt;（保留其 node_modules）
-    ///   ④ 校验新版本号，并同步 profile 的 package.json 里记录的版本
-    /// 返回 null = 成功；否则返回失败原因（给用户看的一句话）。
-    /// </summary>
-    private static string UpdatePluginFile(string profileDir, string pkg, string latest)
-    {
-        string pluginDir = Path.Combine(profileDir, "node_modules", pkg);
-        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        string backupDir = Path.Combine(profileDir, ".backup-update-" + stamp, pkg.Replace('/', '_'));
-        string tempDir = Path.Combine(Path.GetTempPath(), "dsh-launcher-plugin-update-" + stamp);
-        try
-        {
-            // ① 备份
-            CopyDir(pluginDir, backupDir, false);
-            Log("插件更新：" + pkg + " 已备份到 " + backupDir);
-
-            // ② 下载
-            Directory.CreateDirectory(tempDir);
-            string cmd = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
-            RunCapture(cmd, "/c cd /d \"" + tempDir + "\" && npm --no-fund --no-update-notifier pack "
-                + pkg + "@" + latest, 180000);
-            string tgz = null;
-            foreach (string f in Directory.GetFiles(tempDir, "*.tgz"))
-            {
-                tgz = f;
-                break;
-            }
-            if (tgz == null) return "下载失败（npm pack 未产出 tgz）";
-
-            // ③ 解包（Windows 10+ 自带 tar.exe）
-            RunCapture("tar", "-xzf \"" + tgz + "\" -C \"" + tempDir + "\"", 120000);
-            string extracted = Path.Combine(tempDir, "package");
-            if (!Directory.Exists(extracted)) return "解包失败（未找到 package 目录）";
-
-            string newVersion = ReadPackageVersion(Path.Combine(extracted, "package.json"));
-            if (string.IsNullOrEmpty(newVersion)) return "解包内容缺少 package.json";
-            if (CompareVersions(newVersion, latest) != 0)
-                return "下载到的版本是 " + newVersion + "，与预期 " + latest + " 不符";
-
-            // ④ 覆盖（保留 node_modules，避免把依赖清掉）
-            CopyDir(extracted, pluginDir, true);
-            string after = ReadPackageVersion(Path.Combine(pluginDir, "package.json"));
-            if (after != newVersion) return "覆盖后版本号校验失败";
-
-            // ⑤ 同步 profile 的 package.json
-            string pkgPath = Path.Combine(profileDir, "package.json");
-            string text = File.ReadAllText(pkgPath);
-            string pattern = "(\"" + Regex.Escape(pkg) + "\"\\s*:\\s*\")([^\"]*)(\")";
-            string replaced = Regex.Replace(text, pattern, "$1" + latest + "$3");
-            if (replaced != text) File.WriteAllText(pkgPath, replaced, new UTF8Encoding(false));
-            Log("插件更新：" + pkg + " → " + latest + " 完成（备份在 " + backupDir + "）");
-            return null;
-        }
-        catch (Exception ex)
-        {
-            Log("插件更新异常 " + pkg + ": " + ex.Message);
-            return ex.Message;
-        }
-        finally
-        {
-            try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); } catch { }
-        }
     }
 
     /// <summary>递归复制目录（overwrite=false 时目标已存在也照写；子 node_modules 可选保留）。</summary>
@@ -3653,6 +3501,206 @@ try {
             sb.AppendLine("npmhang_leftover_node_pids=" + LeftoverIds(beforePids, NodeProcessIds()));
         }
 
+        // ===== v0.7.0 新增：进度引擎 / 解包器 / 状态自愈 的回归钩子 =====
+        // 全部只在显式设置环境变量时运行，且都在临时目录里操作，绝不碰真实状态。
+
+        // (a) registry 元数据：DSH_LAUNCHER_META_TEST=<pkg>[@version]
+        string metaSpec = Environment.GetEnvironmentVariable("DSH_LAUNCHER_META_TEST");
+        if (!string.IsNullOrEmpty(metaSpec))
+        {
+            try
+            {
+                int at = metaSpec.LastIndexOf('@');
+                string mp = at > 0 ? metaSpec.Substring(0, at) : metaSpec;
+                string mv = at > 0 ? metaSpec.Substring(at + 1) : null;
+                if (string.IsNullOrEmpty(mv)) mv = FetchPackageLatest(mp);
+                sb.AppendLine("meta[" + mp + "]_version=" + (mv ?? "<none>"));
+                if (!string.IsNullOrEmpty(mv))
+                {
+                    VersionMeta vm = FetchVersionMeta(mp, mv);
+                    sb.AppendLine("meta_tarball=" + (vm == null || vm.Tarball == null ? "<none>" : vm.Tarball));
+                    sb.AppendLine("meta_shasum=" + (vm == null || vm.Shasum == null ? "<none>" : vm.Shasum));
+                }
+            }
+            catch (Exception ex) { sb.AppendLine("meta_test_fail=" + ex.Message); }
+        }
+
+        // (b) 带真实进度的下载：DSH_LAUNCHER_DL_TEST=<url>[;<期望字节数>]
+        string dlSpec = Environment.GetEnvironmentVariable("DSH_LAUNCHER_DL_TEST");
+        if (!string.IsNullOrEmpty(dlSpec))
+        {
+            try
+            {
+                string[] parts = dlSpec.Split(';');
+                long expect = -1;
+                if (parts.Length > 1) long.TryParse(parts[1], out expect);
+                string dst = Path.Combine(Path.GetTempPath(), "dsh-launcher-dltest-" + DateTime.Now.Ticks + ".bin");
+                var prog = new ProgressInfo();
+                var dlSw = Stopwatch.StartNew();
+                string dlErr = HttpDownloadToFile(parts[0], dst, prog, null);
+                dlSw.Stop();
+                long actual = File.Exists(dst) ? new FileInfo(dst).Length : -1;
+                sb.AppendLine("dl_error=" + (dlErr ?? "<none>"));
+                sb.AppendLine("dl_bytes=" + actual + " total_reported=" + prog.Total
+                    + " expect=" + (expect >= 0 ? expect.ToString() : "<unset>"));
+                sb.AppendLine("dl_match=" + (expect < 0 ? "<n/a>" : (actual == expect ? "True" : "False")));
+                sb.AppendLine("dl_elapsed_ms=" + (long)dlSw.Elapsed.TotalMilliseconds);
+                sb.AppendLine("dl_progress_text=" + OneLine(prog.DetailText(), 200));
+                try { File.Delete(dst); } catch { }
+            }
+            catch (Exception ex) { sb.AppendLine("dl_test_fail=" + ex.Message); }
+        }
+
+        // (c) 纯 C# 解包 .tar.gz：DSH_LAUNCHER_TAR_TEST=<tgz 路径>[;<期望文件数>]
+        string tarSpec = Environment.GetEnvironmentVariable("DSH_LAUNCHER_TAR_TEST");
+        if (!string.IsNullOrEmpty(tarSpec))
+        {
+            try
+            {
+                string[] parts = tarSpec.Split(';');
+                int expectFiles = -1;
+                if (parts.Length > 1) int.TryParse(parts[1], out expectFiles);
+                string dir = Path.Combine(Path.GetTempPath(), "dsh-launcher-tartest-" + DateTime.Now.Ticks);
+                bool ok = ExtractTarGz(parts[0], dir);
+                int files = (ok && Directory.Exists(dir))
+                    ? Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length : -1;
+                long size = (ok && Directory.Exists(dir)) ? DirectorySize(dir, 1000000) : -1;
+                sb.AppendLine("tar_ok=" + ok);
+                sb.AppendLine("tar_files=" + files + " expect=" + (expectFiles >= 0 ? expectFiles.ToString() : "<unset>")
+                    + " match=" + (expectFiles < 0 ? "<n/a>" : (files == expectFiles ? "True" : "False")));
+                sb.AppendLine("tar_bytes=" + size);
+                string pj = Path.Combine(dir, "package", "package.json");
+                sb.AppendLine("tar_package_json=" + (File.Exists(pj) ? "present" : "missing"));
+                if (File.Exists(pj)) sb.AppendLine("tar_package_version=" + (ReadPackageVersion(pj) ?? "<none>"));
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            }
+            catch (Exception ex) { sb.AppendLine("tar_test_fail=" + ex.Message); }
+        }
+
+        // (d) 状态文件自愈：仅在状态文件已重定向到临时路径时执行（绝不碰真实 version.txt）
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DSH_LAUNCHER_STATE_FILE")))
+        {
+            try
+            {
+                // 连写两次，让 .bak 也承载同一个值；再破坏主文件，读取时应从 .bak 恢复
+                WriteVersionState("9.9.9-heal", null, DateTime.Now, null);
+                WriteVersionState("9.9.9-heal", null, DateTime.Now, null);
+                bool bakOk = File.Exists(VersionFile) && File.Exists(VersionFile + ".bak");
+                File.WriteAllText(VersionFile, "{{{ not a valid state file }}}\n", new UTF8Encoding(false));
+                string hv, hd, hp;
+                DateTime hc;
+                ReadVersionState(out hv, out hd, out hc, out hp);
+                sb.AppendLine("heal_bak_created=" + bakOk);
+                sb.AppendLine("heal_recovered=" + (hv == "9.9.9-heal" ? "True" : "False") + " value=" + (hv ?? "<none>"));
+            }
+            catch (Exception ex) { sb.AppendLine("heal_test_fail=" + ex.Message); }
+        }
+
+        // (e) 插件原子替换端到端：DSH_LAUNCHER_ATOMIC_TEST=<profileDir>;<pkg>;<version>
+        //     用真实 registry 包验证 下载 → SHA1 校验 → 解包 → 原子换入 → 同步 package.json。
+        //     注意：务必指向一份 profile 的**临时副本**，不要指向真实 profile。
+        string atomicSpec = Environment.GetEnvironmentVariable("DSH_LAUNCHER_ATOMIC_TEST");
+        if (!string.IsNullOrEmpty(atomicSpec))
+        {
+            try
+            {
+                string[] parts = atomicSpec.Split(';');
+                if (parts.Length >= 3)
+                {
+                    var aprog = new ProgressInfo();
+                    string aerr = UpdatePluginAtomic(parts[0], parts[1], parts[2], aprog, null);
+                    string installed = ReadPackageVersion(Path.Combine(parts[0], "node_modules", parts[1], "package.json"));
+                    sb.AppendLine("atomic_error=" + (aerr ?? "<none>"));
+                    sb.AppendLine("atomic_installed_version=" + (installed ?? "<none>"));
+                    sb.AppendLine("atomic_match=" + (installed == parts[2] ? "True" : "False"));
+                    sb.AppendLine("atomic_progress=" + OneLine(aprog.DetailText(), 200));
+                    string pj = Path.Combine(parts[0], "package.json");
+                    string spec = null;
+                    if (File.Exists(pj))
+                    {
+                        var m = Regex.Match(File.ReadAllText(pj),
+                            "\"" + Regex.Escape(parts[1]) + "\"\\s*:\\s*\"([^\"]*)\"");
+                        if (m.Success) spec = m.Groups[1].Value;
+                    }
+                    sb.AppendLine("atomic_package_json_spec=" + (spec ?? "<none>"));
+                    // 结构完整性：换入后不应残留 .old-* / .dsh-launcher-staging-* 目录
+                    int leftovers = 0;
+                    string nm = Path.Combine(parts[0], "node_modules");
+                    if (Directory.Exists(nm))
+                    {
+                        foreach (string d in Directory.GetDirectories(nm))
+                        {
+                            string n = Path.GetFileName(d);
+                            if (n.StartsWith(".dsh-launcher-staging-", StringComparison.Ordinal)) leftovers++;
+                        }
+                        string tgt = Path.Combine(nm, parts[1].Replace('/', Path.DirectorySeparatorChar));
+                        string parent = Path.GetDirectoryName(tgt);
+                        string baseName = Path.GetFileName(tgt);
+                        if (!string.IsNullOrEmpty(parent) && Directory.Exists(parent))
+                        {
+                            foreach (string d in Directory.GetDirectories(parent))
+                            {
+                                if (Path.GetFileName(d).StartsWith(baseName + ".old-", StringComparison.Ordinal)) leftovers++;
+                            }
+                        }
+                    }
+                    sb.AppendLine("atomic_leftover_dirs=" + leftovers);
+                }
+                else sb.AppendLine("atomic_test_fail=需要 <profileDir>;<pkg>;<version>");
+            }
+            catch (Exception ex) { sb.AppendLine("atomic_test_fail=" + ex.Message); }
+        }
+
+        // (f) 主窗口构造冒烟测试：DSH_LAUNCHER_UI_TEST=1
+        //     构造真实的主窗口、强制创建句柄并跑一遍布局与进度渲染，验证新 UI 不会抛异常。
+        //     不调用 Show()，所以屏幕上不会闪窗口。
+        if (Environment.GetEnvironmentVariable("DSH_LAUNCHER_UI_TEST") == "1")
+        {
+            try
+            {
+                var mf = new MainForm();
+                try
+                {
+                    sb.AppendLine(mf.SmokeTest());
+                    string shotDir = Path.Combine(Path.GetTempPath(), "dsh-launcher-ui-shots");
+                    try { Directory.CreateDirectory(shotDir); } catch { }
+                    sb.AppendLine(mf.RenderShots(shotDir));
+                }
+                finally { mf.Dispose(); }
+
+                // 进度条渲染路径（百分比 / 未知总量走 marquee / 完成 / 失败）
+                var cand = new UpdateCandidate { Kind = "plugin", Label = "demo-plugin", Current = "1.0.0", Latest = "1.1.0" };
+                var row = new UpdateRow(cand);
+                try
+                {
+                    var pi = new ProgressInfo();
+                    pi.Phase = "下载中";
+                    pi.Received = 500;
+                    pi.Total = 1000;
+                    pi.BytesPerSec = 123456;
+                    pi.Elapsed = TimeSpan.FromSeconds(3);
+                    row.ShowRunning();
+                    row.ShowProgress(pi);
+                    sb.AppendLine("ui_row_percent=" + pi.Percent());
+                    sb.AppendLine("ui_row_bar_value=" + row.BarValue);
+                    sb.AppendLine("ui_row_detail=" + OneLine(pi.DetailText(), 160));
+                    var pi2 = new ProgressInfo();
+                    pi2.Phase = "下载并安装依赖";
+                    pi2.Received = 2 * 1024 * 1024;
+                    pi2.Total = -1;
+                    row.ShowProgress(pi2);
+                    sb.AppendLine("ui_row_unknown_total_detail=" + OneLine(pi2.DetailText(), 160));
+                    row.ShowDone(null);
+                    row.ShowDone("模拟失败原因");
+                    sb.AppendLine("ui_row_render_ok=True");
+                }
+                finally { row.Dispose(); }
+
+                sb.AppendLine("ui_test_ok=True");
+            }
+            catch (Exception ex) { sb.AppendLine("ui_test_fail=" + ex.Message + " @ " + Brief(ex.StackTrace)); }
+        }
+
         try
         {
             File.WriteAllText(outFile, sb.ToString());
@@ -3946,6 +3994,2009 @@ try {
             Thread.Sleep(500);
         }
         return !TcpListening(port, 400);
+    }
+
+    // ============================================================================
+    // v0.7.0：进度感知的下载/安装引擎
+    // ----------------------------------------------------------------------------
+    // 为什么重写这一块：旧版升级只有托盘上一句“正在下载…”（每 15 秒刷一次），
+    // 插件升级更是黑盒（npm pack 无输出）。用户既看不出“在跑”还是“卡住”，
+    // 也拿不到速度/剩余时间，违反“防卡死 + 只报证据”的纪律。
+    // 新引擎直接对 registry 的 tarball 发 HTTP 请求：只要服务端给了
+    // Content-Length，就能给出**真实字节进度 + 实时速度 + 预计剩余时间**；
+    // 解包/校验/替换各自成一个可观测阶段。
+    // ============================================================================
+
+    /// <summary>一条更新任务的实时进度（UI 与托盘共同读取）。</summary>
+    private sealed class ProgressInfo
+    {
+        public string Phase = "等待中";
+        public long Received;
+        public long Total = -1;              // -1 / 0 = 未知总量（此时不显示百分比，只显示已下载量）
+        public double BytesPerSec;
+        public TimeSpan Elapsed;
+        public string Message;
+        public bool Finished;
+        public bool Failed;
+        public DateTime StartedAt = DateTime.Now;
+
+        public int Percent()
+        {
+            if (Total <= 0) return -1;
+            long r = Received < 0 ? 0 : Received;
+            long pct = r * 100L / Total;
+            if (pct > 100) pct = 100;
+            return (int)pct;
+        }
+
+        /// <summary>给界面用的一行说明：阶段 / 进度 / 速度 / 已用时间 / 剩余时间。</summary>
+        public string DetailText()
+        {
+            var sb = new StringBuilder();
+            sb.Append(Phase);
+            if (Total > 0)
+            {
+                int pct = Percent();
+                sb.Append(" ").Append(pct).Append("%（")
+                  .Append(FormatBytes(Received)).Append(" / ").Append(FormatBytes(Total)).Append("）");
+            }
+            else if (Received > 0)
+            {
+                sb.Append(" 已下载 ").Append(FormatBytes(Received));
+            }
+            if (BytesPerSec > 1) sb.Append(" · ").Append(FormatSpeed(BytesPerSec));
+            if (Elapsed.TotalSeconds >= 1)
+            {
+                sb.Append(" · 已用 ").Append(FormatDuration(Elapsed));
+                if (Total > 0 && BytesPerSec > 1)
+                {
+                    double remain = (Total - Received) / BytesPerSec;
+                    if (remain > 0 && remain < 86400) sb.Append(" · 剩余约 ").Append(FormatDuration(TimeSpan.FromSeconds(remain)));
+                }
+            }
+            if (!string.IsNullOrEmpty(Message)) sb.Append(" · ").Append(Message);
+            return sb.ToString();
+        }
+    }
+
+    private static string FormatBytes(long b)
+    {
+        if (b < 0) return "?";
+        if (b < 1024) return b + " B";
+        double kb = b / 1024.0;
+        if (kb < 1024) return kb.ToString("0.0") + " KB";
+        double mb = kb / 1024.0;
+        if (mb < 1024) return mb.ToString("0.0") + " MB";
+        return (mb / 1024.0).ToString("0.00") + " GB";
+    }
+
+    private static string FormatSpeed(double bps)
+    {
+        if (bps <= 1) return "";
+        return FormatBytes((long)bps) + "/s";
+    }
+
+    private static string FormatDuration(TimeSpan t)
+    {
+        if (t.TotalSeconds < 60) return ((int)t.TotalSeconds) + " 秒";
+        if (t.TotalMinutes < 60) return ((int)t.TotalMinutes) + " 分 " + t.Seconds + " 秒";
+        return ((int)t.TotalHours) + " 时 " + t.Minutes + " 分";
+    }
+
+    /// <summary>简易 HTTP GET → 字符串（用于取 registry 元数据；失败返回 null）。</summary>
+    private static string HttpGetString(string url, int timeoutMs)
+    {
+        try
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.UserAgent = "DshLauncher/" + LauncherVersion;
+            req.AllowAutoRedirect = true;
+            req.KeepAlive = false;
+            req.Proxy = null;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            {
+                return sr.ReadToEnd();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("HTTP 请求失败 " + url + " : " + ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>某个 npm 版本的下载信息（tarball 直链 + SHA1 校验和）。</summary>
+    private sealed class VersionMeta
+    {
+        public string Tarball;
+        public string Shasum;
+        public long UnpackedSize = -1;
+    }
+
+    /// <summary>
+    /// 从 npm registry 取指定包指定版本的 tarball 直链与校验和。
+    /// 形如 https://registry.npmjs.org/@scope%2fname/1.2.3 —— 这一步替代了
+    /// 旧版“npm pack 黑盒下载”，是新进度条能拿到总字节数的前提。
+    /// </summary>
+    private static VersionMeta FetchVersionMeta(string pkg, string version)
+    {
+        string url = "https://registry.npmjs.org/" + pkg.Replace("/", "%2f") + "/" + version;
+        string json = HttpGetString(url, 20000);
+        if (string.IsNullOrEmpty(json)) return null;
+        var meta = new VersionMeta();
+        var mt = Regex.Match(json, "\"tarball\"\\s*:\\s*\"([^\"]+)\"");
+        if (mt.Success) meta.Tarball = mt.Groups[1].Value.Replace("\\/", "/");
+        var ms = Regex.Match(json, "\"shasum\"\\s*:\\s*\"([0-9a-fA-F]{40})\"");
+        if (ms.Success) meta.Shasum = ms.Groups[1].Value.ToLowerInvariant();
+        var mu = Regex.Match(json, "\"unpackedSize\"\\s*:\\s*(\\d+)");
+        if (mu.Success) { long v; if (long.TryParse(mu.Groups[1].Value, out v)) meta.UnpackedSize = v; }
+        if (string.IsNullOrEmpty(meta.Tarball)) return null;
+        return meta;
+    }
+
+    /// <summary>
+    /// 带真实进度、**带重试与断点续传**的 HTTP 下载。
+    /// 为什么需要重试：实测本机网络会在下载末尾（98%）瞬时卡死，旧实现一次失败就
+    /// 前功尽弃（正是"0.2.0-rc.2 下载失败"那类现象）。现在：
+    ///   · 失败最多重试 3 次；
+    ///   · 重试用 HTTP Range 从已收到的字节继续（服务端不支持 Range 时自动从头来）；
+    ///   · 每次失败/重试都写进日志与进度文本，卡顿期间也持续刷新"已用时间"。
+    /// 返回 null = 成功；否则为失败原因（可直接展示给用户）。
+    /// </summary>
+    private static string HttpDownloadToFile(string url, string destPath, ProgressInfo p, ManualResetEvent cancel)
+    {
+        const int maxAttempts = 3;
+        string lastErr = null;
+        long written = 0;
+        p.Received = 0;
+        var sw = Stopwatch.StartNew();
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Timeout = 30000;            // 连接/响应头超时
+                req.ReadWriteTimeout = 60000;   // 单次读取停顿上限（超过即判卡死，交给重试）
+                req.UserAgent = "DshLauncher/" + LauncherVersion;
+                req.AllowAutoRedirect = true;
+                req.KeepAlive = false;
+                req.Proxy = null;
+                if (written > 0) req.AddRange(written);   // 断点续传
+
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                {
+                    bool resumed = resp.StatusCode == HttpStatusCode.PartialContent;
+                    if (!resumed && written > 0)
+                    {
+                        // 服务端不认 Range：只能重来
+                        Log("下载：服务端未支持断点续传，从头下载");
+                        written = 0;
+                        p.Received = 0;
+                    }
+                    if (resumed && resp.ContentLength >= 0) p.Total = written + resp.ContentLength;
+                    else p.Total = resp.ContentLength;
+
+                    long lastBytes = written;
+                    TimeSpan lastT = sw.Elapsed;
+                    using (var dst = new FileStream(destPath, resumed ? FileMode.Append : FileMode.Create,
+                               FileAccess.Write, FileShare.None))
+                    using (var src = resp.GetResponseStream())
+                    {
+                        byte[] buf = new byte[65536];
+                        int n;
+                        while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            if (cancel != null && cancel.WaitOne(0)) { p.Message = "已取消"; return "已取消"; }
+                            dst.Write(buf, 0, n);
+                            written += n;
+                            p.Received = written;
+                            TimeSpan now = sw.Elapsed;
+                            if ((now - lastT).TotalMilliseconds >= 400)
+                            {
+                                double dt = (now - lastT).TotalSeconds;
+                                if (dt > 0) p.BytesPerSec = (written - lastBytes) / dt;
+                                lastBytes = written;
+                                lastT = now;
+                            }
+                            p.Elapsed = now;
+                        }
+                    }
+                }
+
+                p.Elapsed = sw.Elapsed;
+                p.BytesPerSec = 0;
+
+                // 已知总量却没下满 = 被服务端/网络截断，继续续传
+                if (p.Total > 0 && written < p.Total)
+                {
+                    lastErr = "下载不完整（" + FormatBytes(written) + " / " + FormatBytes(p.Total) + "）";
+                    if (attempt < maxAttempts && (cancel == null || !cancel.WaitOne(0)))
+                    {
+                        p.Message = "第 " + attempt + " 次不完整，正在续传…";
+                        Log("下载：" + lastErr + "，第 " + (attempt + 1) + " 次续传");
+                        Thread.Sleep(800);
+                        continue;
+                    }
+                    return lastErr;
+                }
+                p.Message = null;
+                return null;
+            }
+            catch (Exception ex)
+            {
+                p.Elapsed = sw.Elapsed;
+                lastErr = ex.Message;
+                Log("下载第 " + attempt + " 次失败：" + lastErr + "（已收到 " + FormatBytes(written) + "）");
+                if (cancel != null && cancel.WaitOne(0)) return "已取消";
+                if (attempt >= maxAttempts) return lastErr;
+                p.Message = "第 " + attempt + " 次失败，1.2 秒后重试…";
+                Thread.Sleep(1200);
+            }
+        }
+        return lastErr ?? "下载失败";
+    }
+
+    private static string Sha1OfFile(string path)
+    {
+        try
+        {
+            using (var sha = SHA1.Create())
+            using (var fs = File.OpenRead(path))
+            {
+                byte[] h = sha.ComputeHash(fs);
+                var sb = new StringBuilder();
+                foreach (byte b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
+            }
+        }
+        catch { return null; }
+    }
+
+    /// <summary>目录总字节数（有界：最多数 maxEntries 个文件，避免大目录卡住采样线程）。</summary>
+    private static long DirectorySize(string dir, int maxEntries)
+    {
+        long total = 0;
+        int count = 0;
+        var stack = new Stack<string>();
+        stack.Push(dir);
+        while (stack.Count > 0 && count < maxEntries)
+        {
+            string d = stack.Pop();
+            try
+            {
+                foreach (string f in Directory.GetFiles(d))
+                {
+                    try { total += new FileInfo(f).Length; } catch { }
+                    count++;
+                    if (count >= maxEntries) break;
+                }
+                foreach (string sd in Directory.GetDirectories(d)) stack.Push(sd);
+            }
+            catch { }
+        }
+        return total;
+    }
+
+    // ---------- 纯 C# tar.gz 解包（不依赖系统 tar.exe，兼容没有 tar 的旧 Windows）----------
+
+    private static bool ReadExact(Stream s, byte[] buf, int count)
+    {
+        int off = 0;
+        while (off < count)
+        {
+            int n = s.Read(buf, off, count - off);
+            if (n <= 0) return false;
+            off += n;
+        }
+        return true;
+    }
+
+    private static bool IsAllZero(byte[] b)
+    {
+        for (int i = 0; i < b.Length; i++) if (b[i] != 0) return false;
+        return true;
+    }
+
+    private static string ReadStr(byte[] b, int off, int len)
+    {
+        int end = off;
+        while (end < off + len && b[end] != 0) end++;
+        return Encoding.UTF8.GetString(b, off, end - off).Trim();
+    }
+
+    private static long ParseOctal(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return 0;
+        s = s.Trim().Trim('\0').Trim();
+        long r = 0;
+        foreach (char c in s)
+        {
+            if (c < '0' || c > '7') break;
+            r = r * 8 + (c - '0');
+        }
+        return r;
+    }
+
+    private static void SkipBytes(Stream s, long count)
+    {
+        if (count <= 0) return;
+        byte[] buf = new byte[8192];
+        long left = count;
+        while (left > 0)
+        {
+            int n = s.Read(buf, 0, (int)Math.Min((long)buf.Length, left));
+            if (n <= 0) break;
+            left -= n;
+        }
+    }
+
+    private static void SkipPadding(Stream s, long size)
+    {
+        long pad = (512 - (size % 512)) % 512;
+        if (pad > 0) SkipBytes(s, pad);
+    }
+
+    private static void CopyN(Stream src, Stream dst, long count)
+    {
+        byte[] buf = new byte[65536];
+        long left = count;
+        while (left > 0)
+        {
+            int n = src.Read(buf, 0, (int)Math.Min((long)buf.Length, left));
+            if (n <= 0) break;
+            dst.Write(buf, 0, n);
+            left -= n;
+        }
+    }
+
+    private static string ParsePaxPath(byte[] data)
+    {
+        try
+        {
+            string text = Encoding.UTF8.GetString(data);
+            foreach (string line in text.Split('\n'))
+            {
+                if (line.Length == 0) continue;
+                int sp = line.IndexOf(' ');
+                if (sp <= 0) continue;
+                int eq = line.IndexOf('=', sp + 1);
+                if (eq <= 0) continue;
+                string key = line.Substring(sp + 1, eq - sp - 1);
+                if (key == "path") return line.Substring(eq + 1);
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>
+    /// 纯 C# 解包 .tar.gz。支持 ustar 的 prefix 长路径、PAX 扩展头('x') 与
+    /// GNU longname('L')；对 ../ 路径穿越做防御。返回 false 表示解包失败。
+    /// </summary>
+    private static bool ExtractTarGz(string tgzPath, string destDir)
+    {
+        try
+        {
+            Directory.CreateDirectory(destDir);
+            string rootFull = Path.GetFullPath(destDir);
+            if (!rootFull.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                rootFull += Path.DirectorySeparatorChar;
+
+            using (var fs = File.OpenRead(tgzPath))
+            using (var gz = new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress))
+            {
+                byte[] header = new byte[512];
+                string pendingName = null;
+                while (true)
+                {
+                    if (!ReadExact(gz, header, 512)) break;
+                    if (IsAllZero(header)) break;                 // 归档结束块
+
+                    string name = ReadStr(header, 0, 100);
+                    long size = ParseOctal(ReadStr(header, 124, 12));
+                    char type = (char)header[156];
+                    string prefix = ReadStr(header, 345, 155);
+
+                    // 扩展头：先吃掉它的数据，名字留给下一个真实条目
+                    if (type == 'x' || type == 'g' || type == 'L' || type == 'K')
+                    {
+                        byte[] data = new byte[size];
+                        if (size > 0) ReadExact(gz, data, (int)size);
+                        SkipPadding(gz, size);
+                        if (type == 'x') { string pn = ParsePaxPath(data); if (pn != null) pendingName = pn; }
+                        else if (type == 'L') pendingName = Encoding.UTF8.GetString(data).TrimEnd('\0');
+                        continue;
+                    }
+
+                    if (!string.IsNullOrEmpty(prefix) && name.IndexOf('/') < 0) name = prefix + "/" + name;
+                    if (pendingName != null) { name = pendingName; pendingName = null; }
+
+                    string rel = name.Replace('\\', '/').TrimStart('/');
+                    if (rel.StartsWith("./", StringComparison.Ordinal)) rel = rel.Substring(2);
+                    if (rel.Length == 0)
+                    {
+                        if (size > 0) { SkipBytes(gz, size); SkipPadding(gz, size); }
+                        continue;
+                    }
+
+                    string outPath = Path.GetFullPath(Path.Combine(rootFull, rel.Replace('/', Path.DirectorySeparatorChar)));
+                    if (!outPath.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log("解包：跳过越界路径 " + rel);
+                        if (size > 0) { SkipBytes(gz, size); SkipPadding(gz, size); }
+                        continue;
+                    }
+
+                    bool isDir = (type == '5') || (rel.EndsWith("/", StringComparison.Ordinal) && size == 0);
+                    if (isDir)
+                    {
+                        Directory.CreateDirectory(outPath);
+                        if (size > 0) { SkipBytes(gz, size); SkipPadding(gz, size); }
+                        continue;
+                    }
+
+                    if (type == '0' || type == '\0' || type == ' ' || type == '7')
+                    {
+                        string parent = Path.GetDirectoryName(outPath);
+                        if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+                        using (var outFs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        {
+                            CopyN(gz, outFs, size);
+                        }
+                        SkipPadding(gz, size);
+                        continue;
+                    }
+
+                    // 符号链接等其它类型：跳过内容（npm 包里不需要）
+                    if (size > 0) { SkipBytes(gz, size); SkipPadding(gz, size); }
+                }
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log("tar.gz 解包失败: " + ex.Message);
+            return false;
+        }
+    }
+
+    // ---------- 原子插件替换 ----------
+
+    /// <summary>
+    /// 文件级插件更新（v0.7.0 重写为“可观测 + 原子 + 可回滚”）：
+    ///   ① 取 registry 元数据 → ② 带进度下载 tarball → ③ SHA1 校验
+    ///   → ④ 解包 → ⑤ 在**同一卷**上拼装 staging（并保留原插件的 node_modules）
+    ///   → ⑥ 备份原目录 → ⑦ rename 换入（失败自动 rename 回滚） → ⑧ 同步 package.json。
+    /// 返回 null = 成功；否则返回可展示的失败原因。progress 会持续更新。
+    /// </summary>
+    private static string UpdatePluginAtomic(string profileDir, string pkg, string latest,
+        ProgressInfo progress, ManualResetEvent cancel)
+    {
+        string nm = Path.Combine(profileDir, "node_modules");
+        string target = Path.Combine(nm, pkg);
+        string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
+        string work = Path.Combine(Path.GetTempPath(), "dsh-launcher-upd-" + stamp);
+        // staging 必须与目标同卷（node_modules 下），才能用 rename 原子换入
+        string staging = Path.Combine(nm, ".dsh-launcher-staging-" + stamp);
+        string backupDir = Path.Combine(profileDir, ".backup-update-" + stamp, pkg.Replace('/', '_'));
+        string oldDir = target + ".old-" + stamp;
+        try
+        {
+            if (!Directory.Exists(target)) return "插件目录不存在：" + target;
+
+            // ① 元数据
+            progress.Phase = "查询版本信息";
+            progress.Total = -1;
+            progress.Received = 0;
+            progress.BytesPerSec = 0;
+            VersionMeta meta = FetchVersionMeta(pkg, latest);
+            if (meta == null || string.IsNullOrEmpty(meta.Tarball))
+                return "无法获取下载地址（网络不通，或该版本在 registry 上不存在）";
+
+            // ② 下载（真实字节进度）
+            Directory.CreateDirectory(work);
+            string tgz = Path.Combine(work, "package.tgz");
+            progress.Phase = "下载中";
+            progress.StartedAt = DateTime.Now;
+            string derr = HttpDownloadToFile(meta.Tarball, tgz, progress, cancel);
+            if (derr != null) return "下载失败：" + derr;
+
+            // ③ 校验
+            progress.Phase = "校验完整性";
+            if (!string.IsNullOrEmpty(meta.Shasum))
+            {
+                string actual = Sha1OfFile(tgz);
+                if (string.IsNullOrEmpty(actual) || !string.Equals(actual, meta.Shasum, StringComparison.OrdinalIgnoreCase))
+                    return "完整性校验失败（SHA1 不符，下载可能被截断）";
+            }
+
+            // ④ 解包
+            progress.Phase = "解包中";
+            string ext = Path.Combine(work, "x");
+            if (!ExtractTarGz(tgz, ext)) return "解包失败（tar.gz 损坏或读写出错）";
+            string pkgSrc = Path.Combine(ext, "package");
+            if (!Directory.Exists(pkgSrc)) return "解包失败（压缩包里没有 package 目录）";
+
+            string newVersion = ReadPackageVersion(Path.Combine(pkgSrc, "package.json"));
+            if (string.IsNullOrEmpty(newVersion)) return "新包缺少 package.json";
+            if (CompareVersions(newVersion, latest) != 0)
+                return "下载到的版本是 " + newVersion + "，与预期 " + latest + " 不符";
+
+            // ⑤ 拼装 staging：新文件 + 保留原插件的 node_modules（依赖）
+            progress.Phase = "准备文件";
+            Directory.CreateDirectory(staging);
+            CopyDir(pkgSrc, staging, false);
+            string existingNm = Path.Combine(target, "node_modules");
+            if (Directory.Exists(existingNm))
+                CopyDir(existingNm, Path.Combine(staging, "node_modules"), false);
+
+            // ⑥ 备份原目录（整份，失败可人工回滚）
+            progress.Phase = "备份原版本";
+            CopyDir(target, backupDir, false);
+
+            // ⑦ 原子换入
+            progress.Phase = "替换文件";
+            bool movedOld = false;
+            try
+            {
+                Directory.Move(target, oldDir);
+                movedOld = true;
+                Directory.Move(staging, target);
+            }
+            catch (Exception ex)
+            {
+                // 回滚：把原目录搬回去
+                try
+                {
+                    if (movedOld && !Directory.Exists(target) && Directory.Exists(oldDir))
+                        Directory.Move(oldDir, target);
+                }
+                catch (Exception rex) { Log("回滚失败（原目录仍在 " + oldDir + "）: " + rex.Message); }
+                return "替换失败（已尝试回滚）：" + ex.Message;
+            }
+
+            // 覆盖后校验；失败立即回滚
+            string after = ReadPackageVersion(Path.Combine(target, "package.json"));
+            if (after != newVersion)
+            {
+                try
+                {
+                    if (Directory.Exists(target)) Directory.Delete(target, true);
+                    if (Directory.Exists(oldDir)) Directory.Move(oldDir, target);
+                }
+                catch (Exception rex) { Log("覆盖校验失败后的回滚出错（原目录 " + oldDir + "）: " + rex.Message); }
+                return "覆盖后版本号校验失败（已回滚）";
+            }
+            try { if (Directory.Exists(oldDir)) Directory.Delete(oldDir, true); } catch { }
+
+            // ⑧ 同步 profile package.json 里记录的版本
+            SyncProfilePackageVersion(profileDir, pkg, latest);
+
+            progress.Phase = "完成";
+            progress.Received = progress.Total > 0 ? progress.Total : progress.Received;
+            progress.BytesPerSec = 0;
+            Log("插件更新：" + pkg + " → " + latest + " 完成（备份在 " + backupDir + "）");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Log("插件更新异常 " + pkg + ": " + ex.Message);
+            return ex.Message;
+        }
+        finally
+        {
+            try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch { }
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch { }
+        }
+    }
+
+    /// <summary>把 profile 的 package.json 里该插件的版本号同步为 latest（保留原格式）。</summary>
+    private static void SyncProfilePackageVersion(string profileDir, string pkg, string latest)
+    {
+        try
+        {
+            string pkgPath = Path.Combine(profileDir, "package.json");
+            if (!File.Exists(pkgPath)) return;
+            string text = File.ReadAllText(pkgPath);
+            string pattern = "(\"" + Regex.Escape(pkg) + "\"\\s*:\\s*\")([^\"]*)(\")";
+            // 注意：绝不能用 "$1" + latest + "$3" —— latest 以数字开头时，$1 会与后面的
+            // 数字拼成 $11（不存在的组）而把内容写坏（实测把 package.json 变成 {$11.3.0"}）。
+            // 用 MatchEvaluator 明确拼接，天然没有这个歧义。
+            string replaced = Regex.Replace(text, pattern,
+                delegate (Match m) { return m.Groups[1].Value + latest + m.Groups[3].Value; });
+            if (replaced != text)
+            {
+                File.WriteAllText(pkgPath, replaced, new UTF8Encoding(false));
+                Log("已同步 " + Path.GetFileName(profileDir) + "/package.json 中 " + pkg + " 的版本号为 " + latest);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("同步 package.json 版本失败: " + ex.Message);
+        }
+    }
+
+    // ---------- dsh 本体：带进度观测的安装 ----------
+
+    /// <summary>
+    /// 安装指定 dsh 版本到 npx 缓存（只安装、不启动服务），并实时报告“已安装体量 + 速度”。
+    /// 做法：比对 `_npx` 下新增的目录并对它采样 —— npm 会把整棵依赖树装在那个新目录里，
+    /// 因此它的增长就是真实进度。依赖树总量无法预知，所以这里**不假装有百分比**，
+    /// 只如实给“已下载 X / 速度 Y / 已用 Z”。返回 null 成功，否则失败原因。
+    /// </summary>
+    private static string InstallVersionProgress(string version, ProgressInfo progress, ManualResetEvent cancel)
+    {
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string npxRoot = Path.Combine(local, "npm-cache", "_npx");
+        var before = new HashSet<string>();
+        try { foreach (string d in Directory.GetDirectories(npxRoot)) before.Add(d); } catch { }
+
+        var stop = new ManualResetEvent(false);
+        var monitor = new Thread(delegate ()
+        {
+            long lastSize = 0;
+            DateTime lastT = DateTime.Now;
+            while (!stop.WaitOne(700))
+            {
+                long total = 0;
+                try
+                {
+                    foreach (string d in Directory.GetDirectories(npxRoot))
+                    {
+                        if (before.Contains(d)) continue;        // 只看这次新增的目录
+                        total += DirectorySize(d, 200000);
+                    }
+                }
+                catch { }
+                progress.Received = total;
+                DateTime now = DateTime.Now;
+                double dt = (now - lastT).TotalSeconds;
+                if (dt >= 0.5)
+                {
+                    double sp = (total - lastSize) / dt;
+                    progress.BytesPerSec = sp > 0 ? sp : 0;
+                    lastSize = total;
+                    lastT = now;
+                }
+                progress.Elapsed = now - progress.StartedAt;
+                if (cancel != null && cancel.WaitOne(0)) break;
+            }
+        });
+        monitor.IsBackground = true;
+        monitor.Start();
+        try
+        {
+            progress.Phase = "下载并安装依赖";
+            progress.StartedAt = DateTime.Now;
+            progress.Total = -1;
+            string output = RunNpmCapture(
+                "exec --yes --package=@deepseek-ai/dsh@" + version + " -- dsh --version", InstallTimeoutMs);
+            bool ok = output != null && output.IndexOf(version, StringComparison.OrdinalIgnoreCase) >= 0;
+            progress.BytesPerSec = 0;
+            if (!ok && cancel != null && cancel.WaitOne(0)) return "已取消";
+            return ok ? null : "安装命令失败或超时（详见日志）";
+        }
+        finally
+        {
+            stop.Set();
+        }
+    }
+
+    // ---------- 安全模式（插件把自己修坏时的“破窗”通道）----------
+
+    /// <summary>
+    /// 安全模式：把所有第三方插件暂时摘除（复用已验证的 DisablePluginEverywhere，
+    /// 改前整份备份），让服务一定起得来；被摘除的清单写进状态目录，便于一键还原。
+    /// 返回被禁用的插件名列表。
+    /// </summary>
+    private static List<string> EnterSafeMode()
+    {
+        var disabled = new List<string>();
+        try
+        {
+            // 先对本机每个 profile 做一次显式备份，并**精确记录路径** —— 这样
+            // “退出安全模式”能明确从哪一份还原，不靠“猜最新备份目录”。
+            var backupMap = new List<string>();
+            foreach (string dir in ListProfileDirs())
+            {
+                string bk = BackupProfileFiles(dir);
+                backupMap.Add(Path.GetFileName(dir) + "=" + bk);
+            }
+
+            var plugins = new List<string>();
+            foreach (string dir in ListProfileDirs())
+            {
+                string text;
+                try { text = File.ReadAllText(Path.Combine(dir, "package.json")); }
+                catch { continue; }
+                var m = Regex.Match(text, @"""bundles""\s*:\s*\[(.*?)\]", RegexOptions.Singleline);
+                if (!m.Success) continue;
+                foreach (Match e in Regex.Matches(m.Groups[1].Value, @"""([^""]+)"""))
+                {
+                    string b = e.Groups[1].Value;
+                    if (b.StartsWith("@deepseek-ai/", StringComparison.Ordinal)) continue;
+                    if (!plugins.Contains(b)) plugins.Add(b);
+                }
+            }
+            foreach (string p in plugins)
+            {
+                DisablePluginEverywhere(p, null);
+                disabled.Add(p);
+            }
+            try
+            {
+                EnsureAppDataDir();
+                var lines = new List<string>();
+                lines.Add("# 安全模式记录：第一段是已摘除的第三方插件，第二段是各 profile 的还原来源备份");
+                lines.Add("# 如需还原请用托盘菜单“退出安全模式（还原被摘除的插件）”");
+                lines.Add("time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                lines.Add("disabled=" + string.Join(",", disabled.ToArray()));
+                foreach (string b in backupMap) lines.Add("backup:" + b);
+                File.WriteAllLines(Path.Combine(AppDataDir, "safe-mode.txt"), lines.ToArray(), new UTF8Encoding(false));
+            }
+            catch { }
+            Log("安全模式：已摘除第三方插件 " + disabled.Count + " 个，已记录还原来源 " + backupMap.Count + " 条");
+        }
+        catch (Exception ex)
+        {
+            Log("进入安全模式失败: " + ex.Message);
+        }
+        return disabled;
+    }
+
+    /// <summary>
+    /// 退出安全模式：按记录把各 profile 的配置文件从备份还原回去，并删除标记。
+    /// 这是“插件/版本被改坏后怎么救回来”的正式通道，改动可逆。
+    /// </summary>
+    private static string ExitSafeMode()
+    {
+        var report = new StringBuilder();
+        var map = new List<string>();
+        try
+        {
+            string marker = Path.Combine(AppDataDir, "safe-mode.txt");
+            if (File.Exists(marker))
+            {
+                foreach (string line in File.ReadAllLines(marker))
+                {
+                    string t = line.Trim();
+                    if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal)) continue;
+                    if (t.StartsWith("time=", StringComparison.Ordinal) || t.StartsWith("disabled=", StringComparison.Ordinal)) continue;
+                    if (t.StartsWith("backup:", StringComparison.Ordinal)) map.Add(t.Substring(7));
+                }
+            }
+            foreach (string entry in map)
+            {
+                int eq = entry.IndexOf('=');
+                if (eq <= 0) continue;
+                string prof = entry.Substring(0, eq);
+                string bk = entry.Substring(eq + 1);
+                string dir = Path.Combine(DshProfilesRoot(), prof);
+                if (!Directory.Exists(dir)) { report.AppendLine("· " + prof + "：profile 目录不存在，跳过"); continue; }
+                int n = 0;
+                foreach (string name in new string[] { "package.json", "pnpm-workspace.yaml", "cordis.patch.yml", "cordis.yml" })
+                {
+                    string src = Path.Combine(bk, name);
+                    if (File.Exists(src)) { File.Copy(src, Path.Combine(dir, name), true); n++; }
+                }
+                report.AppendLine("· " + prof + "：已从 " + bk + " 还原 " + n + " 个配置文件");
+            }
+            if (map.Count == 0) report.AppendLine("（没有找到安全模式的还原记录）");
+            try { File.Delete(Path.Combine(AppDataDir, "safe-mode.txt")); } catch { }
+            Log("退出安全模式：" + OneLine(report.ToString(), 400));
+        }
+        catch (Exception ex)
+        {
+            report.AppendLine("还原失败：" + ex.Message);
+            Log("退出安全模式失败: " + ex.Message);
+        }
+        return report.ToString();
+    }
+
+    private static void ExitSafeModeUi()
+    {
+        if (!IsSafeMode())
+        {
+            Msg("当前不在安全模式。", MessageBoxIcon.Information);
+            return;
+        }
+        if (MessageBox.Show(
+                "将把各 profile 的配置文件还原到“进入安全模式前”的状态，" +
+                "第三方插件会恢复。\n\n确定退出安全模式吗？",
+                AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button1) != DialogResult.Yes) return;
+        string rep = ExitSafeMode();
+        Msg("已退出安全模式。\n\n" + rep +
+            "\n请用托盘 →“停止服务并退出”，再重新双击启动器，让插件重新加载。",
+            MessageBoxIcon.Information);
+    }
+
+    /// <summary>是否处于安全模式（存在标记文件）。</summary>
+    private static bool IsSafeMode()
+    {
+        try { return File.Exists(Path.Combine(AppDataDir, "safe-mode.txt")); }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// 备份保留策略：**只清理插件更新自动产生的 .backup-update-* 目录**（每个 profile 留最近 keep 份），
+    /// 绝不碰其它 .backup-* —— 那些是排障/回滚用的关键点，误删不可恢复。
+    /// </summary>
+    private static void PruneBackups(int keep)
+    {
+        try
+        {
+            foreach (string dir in ListProfileDirs())
+            {
+                var updates = new List<string>();
+                try
+                {
+                    foreach (string d in Directory.GetDirectories(dir))
+                    {
+                        string n = Path.GetFileName(d);
+                        if (n.StartsWith(".backup-update-", StringComparison.OrdinalIgnoreCase)) updates.Add(d);
+                    }
+                }
+                catch { continue; }
+                if (updates.Count <= keep) continue;
+                updates.Sort(StringComparer.OrdinalIgnoreCase);
+                int remove = updates.Count - keep;
+                for (int i = 0; i < remove; i++)
+                {
+                    try { Directory.Delete(updates[i], true); Log("清理旧插件更新备份 " + updates[i]); }
+                    catch (Exception ex) { Log("清理旧插件更新备份失败 " + updates[i] + ": " + ex.Message); }
+                }
+            }
+        }
+        catch (Exception ex) { Log("备份清理异常: " + ex.Message); }
+    }
+
+    // ============================================================================
+    // v0.7.0：主窗口（控制面板）
+    // ----------------------------------------------------------------------------
+    // 旧版没有窗口：状态在托盘 tooltip、升级在 MessageBox、插件检查在 MessageBox、
+    // 日志在文件里 —— 信息四处分散，用户得自己拼。新版把这一切收进一个窗口，
+    // 分 5 个页签：概览 / 更新（带进度条）/ 插件 / 日志 / 关于。
+    // 默认**隐藏**：仅当双击托盘、或点托盘“打开控制面板”时出现，不改变原有使用习惯。
+    // 全部使用系统标准控件与系统字体，不画自绘皮肤（UI 风格保持系统风格）。
+    // ============================================================================
+
+    private static MainForm mainForm;                                   // 惰性创建，关闭只是隐藏
+    private static readonly ManualResetEvent updateCancel = new ManualResetEvent(false);
+
+    /// <summary>显示（必要时创建）控制面板。可从任意线程调用。</summary>
+    private static void ShowMainWindow()
+    {
+        Ui(delegate
+        {
+            try
+            {
+                if (mainForm == null || mainForm.IsDisposed) mainForm = new MainForm();
+                if (!mainForm.Visible) mainForm.Show();
+                if (mainForm.WindowState == FormWindowState.Minimized)
+                    mainForm.WindowState = FormWindowState.Normal;
+                mainForm.Activate();
+                mainForm.BringToFront();
+                mainForm.RefreshStatus();
+            }
+            catch (Exception ex) { Log("打开控制面板失败: " + ex.Message); }
+        });
+    }
+
+    /// <summary>切到“更新”页并立即检查（托盘“检查更新…”入口）。</summary>
+    private static void ShowMainWindowUpdates()
+    {
+        ShowMainWindow();
+        Ui(delegate
+        {
+            try
+            {
+                if (mainForm == null) return;
+                mainForm.SelectUpdatesTab();
+                mainForm.RefreshUpdates();
+            }
+            catch (Exception ex) { Log("打开更新页失败: " + ex.Message); }
+        });
+    }
+
+    /// <summary>切到“插件”页并立即扫描（托盘“插件兼容检查…”入口）。</summary>
+    private static void ShowMainWindowPlugins()
+    {
+        ShowMainWindow();
+        Ui(delegate
+        {
+            try
+            {
+                if (mainForm == null) return;
+                mainForm.SelectPluginsTab();
+                mainForm.RefreshPlugins();
+            }
+            catch (Exception ex) { Log("打开插件页失败: " + ex.Message); }
+        });
+    }
+
+    /// <summary>主窗口：状态条 + 主操作 + 5 个页签。系统风格，无自绘。</summary>
+    private sealed class MainForm : Form
+    {
+        // 顶部状态条
+        private Label dot, state, ver, pid;
+        private Button actOpen, actCheck, actStop;
+        private TabControl tabs;
+
+        // 概览
+        private Label ovState, ovVersion, ovPid, ovStart, ovUptime, ovAddr;
+        private TextBox ovUrlBox;
+        private Button ovCopy, ovReopen;
+
+        // 更新
+        private FlowLayoutPanel updList;
+        private Label updHint;
+        private Button updRefresh, updSelectAll, updSelectNone, updApply, updCancelBtn;
+        private readonly List<UpdateRow> updRows = new List<UpdateRow>();
+        private volatile bool updBusy;
+
+        // 插件
+        private ListView plugList;
+        private Button plugRefresh, plugDisable;
+
+        // 日志
+        private TextBox logBox;
+        private Button logRefresh, logOpen;
+
+        // 关于
+        private Label aboutLabel;
+
+        private System.Windows.Forms.Timer fastTimer, slowTimer;
+
+        public MainForm()
+        {
+            // ---- 窗体本身：系统风格 ----
+            Text = AppTitle + " — 控制面板";
+            Font = SystemFonts.MessageBoxFont;
+            AutoScaleMode = AutoScaleMode.Font;
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(720, 560);
+            MinimumSize = new Size(600, 440);
+            ShowInTaskbar = true;
+            Icon = CreateTrayIcon();
+
+            // ---- 根布局：状态条（固定高）+ 页签（填满）----
+            var root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.ColumnCount = 1;
+            root.RowCount = 2;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 112));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            Controls.Add(root);
+
+            root.Controls.Add(BuildHeader(), 0, 0);
+
+            tabs = new TabControl();
+            tabs.Dock = DockStyle.Fill;
+            tabs.Padding = new Point(14, 5);
+            tabs.TabPages.Add(BuildOverviewTab());
+            tabs.TabPages.Add(BuildUpdatesTab());
+            tabs.TabPages.Add(BuildPluginsTab());
+            tabs.TabPages.Add(BuildLogTab());
+            tabs.TabPages.Add(BuildAboutTab());
+            root.Controls.Add(tabs, 0, 1);
+
+            // ---- 刷新定时器：进度 200ms / 状态与日志 2s（都不阻塞 UI）----
+            fastTimer = new System.Windows.Forms.Timer();
+            fastTimer.Interval = 200;
+            fastTimer.Tick += delegate { TickProgress(); };
+            fastTimer.Start();
+
+            slowTimer = new System.Windows.Forms.Timer();
+            slowTimer.Interval = 2000;
+            slowTimer.Tick += delegate { RefreshStatus(); RefreshLog(); };
+            slowTimer.Start();
+        }
+
+        private Panel BuildHeader()
+        {
+            var header = new Panel();
+            header.Dock = DockStyle.Fill;
+            header.BackColor = SystemColors.Control;
+
+            dot = new Label();
+            dot.SetBounds(16, 16, 14, 14);
+            dot.Text = "";
+            dot.BackColor = SystemColors.GrayText;
+            header.Controls.Add(dot);
+
+            state = new Label();
+            state.AutoSize = true;
+            state.Font = new Font(Font, FontStyle.Bold);
+            state.Text = "正在检查服务状态…";
+            state.SetBounds(38, 10, 300, 22);
+            header.Controls.Add(state);
+
+            ver = new Label();
+            ver.AutoSize = true;
+            ver.ForeColor = SystemColors.GrayText;
+            ver.Text = "";
+            ver.SetBounds(40, 34, 320, 18);
+            header.Controls.Add(ver);
+
+            pid = new Label();
+            pid.AutoSize = true;
+            pid.ForeColor = SystemColors.GrayText;
+            pid.Text = "";
+            pid.SetBounds(40, 54, 400, 18);
+            header.Controls.Add(pid);
+
+            // 按钮独占一行靠左：旧写法 Dock=Right 的面板会盖住较宽的版本/进程文字，
+            // 而且按钮自动变宽后会顶到窗体边缘被裁掉。
+            var actions = new FlowLayoutPanel();
+            actions.FlowDirection = FlowDirection.LeftToRight;
+            actions.WrapContents = false;
+            actions.AutoSize = true;
+            actions.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            actions.Location = new Point(10, 76);
+            actions.Anchor = AnchorStyles.Left | AnchorStyles.Top;
+            header.Controls.Add(actions);
+
+            actOpen = NewButton("打开网页", 92);
+            actOpen.Click += delegate { OpenUrl(); };
+            actCheck = NewButton("检查更新", 92);
+            actCheck.Click += delegate { SelectUpdatesTab(); RefreshUpdates(); };
+            actStop = NewButton("停止服务", 92);
+            actStop.Click += delegate
+            {
+                if (MessageBox.Show(this, "停止服务会断开浏览器里正在使用的页面。\n\n确定要停止并退出启动器吗？",
+                        AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2)
+                    == DialogResult.Yes)
+                    ExitWithServiceHandling();
+            };
+            actions.Controls.Add(actOpen);
+            actions.Controls.Add(actCheck);
+            actions.Controls.Add(actStop);
+            return header;
+        }
+
+        /// <summary>
+        /// 统一按钮工厂：按文字自动定宽（GrowAndShrink + 最小宽度）。
+        /// 这样任何语言/字号下按钮文字都不会被裁掉 —— 旧写法固定像素宽，
+        /// 实测在较大系统字体下会把“禁用不兼容插件”裁成“禁用不兼容插”。
+        /// </summary>
+        private static Button NewButton(string text, int minWidth)
+        {
+            var b = new Button();
+            b.Text = text;
+            b.AutoSize = true;
+            b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            b.MinimumSize = new Size(minWidth, 28);
+            b.Padding = new Padding(8, 0, 8, 0);
+            b.Margin = new Padding(6, 0, 0, 0);
+            return b;
+        }
+
+        // ---------------- 概览 ----------------
+
+        private TabPage BuildOverviewTab()
+        {
+            var page = new TabPage("概览");
+            page.Padding = new Padding(14, 12, 14, 12);
+
+            var t = new TableLayoutPanel();
+            t.Dock = DockStyle.Fill;
+            t.ColumnCount = 2;
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            for (int i = 0; i < 5; i++) t.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // 访问地址（输入框 + 两个按钮）
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));   // 状态提示
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // 底部说明（吃掉剩余高度并可换行）
+            t.RowCount = 8;
+            page.Controls.Add(t);
+
+            ovState = AddRow(t, 0, "服务状态");
+            ovVersion = AddRow(t, 1, "使用版本");
+            ovPid = AddRow(t, 2, "服务进程");
+            ovStart = AddRow(t, 3, "启动时间");
+            ovUptime = AddRow(t, 4, "运行时长");
+
+            var cap = new Label();
+            cap.Text = "访问地址";
+            cap.AutoSize = true;
+            cap.ForeColor = SystemColors.GrayText;
+            cap.Anchor = AnchorStyles.Left;
+            cap.Margin = new Padding(0, 6, 8, 0);
+            t.Controls.Add(cap, 0, 5);
+
+            // 固定列宽交给 TableLayoutPanel 排版：旧写法靠 Resize 手算坐标，
+            // 结果“重新打开”按钮被父容器裁掉一半（实测）。
+            var urlRow = new TableLayoutPanel();
+            urlRow.Dock = DockStyle.Fill;
+            urlRow.ColumnCount = 2;
+            urlRow.RowCount = 1;
+            urlRow.Margin = new Padding(0);
+            urlRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            urlRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            ovUrlBox = new TextBox();
+            ovUrlBox.ReadOnly = true;
+            ovUrlBox.Dock = DockStyle.Fill;
+            ovUrlBox.Margin = new Padding(0, 6, 6, 6);
+            urlRow.Controls.Add(ovUrlBox, 0, 0);
+
+            // 两颗按钮放进自适应流式面板：宽度由文字决定，任何字体下都不会被挤掉半个字
+            var urlBtns = new FlowLayoutPanel();
+            urlBtns.FlowDirection = FlowDirection.LeftToRight;
+            urlBtns.WrapContents = false;
+            urlBtns.AutoSize = true;
+            urlBtns.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            urlBtns.Margin = new Padding(0);
+            urlBtns.Padding = new Padding(0, 4, 0, 4);
+
+            ovCopy = NewButton("复制", 60);
+            ovCopy.Click += delegate
+            {
+                try
+                {
+                    if (!string.IsNullOrEmpty(ovUrlBox.Text)) Clipboard.SetText(ovUrlBox.Text);
+                    SetHint(ovAddr, "已复制到剪贴板。");
+                }
+                catch (Exception ex) { SetHint(ovAddr, "复制失败：" + ex.Message); }
+            };
+            urlBtns.Controls.Add(ovCopy);
+
+            ovReopen = NewButton("重新打开", 90);
+            ovReopen.Click += delegate { OpenUrl(); };
+            urlBtns.Controls.Add(ovReopen);
+            urlRow.Controls.Add(urlBtns, 1, 0);
+            t.Controls.Add(urlRow, 1, 5);
+
+            ovAddr = new Label();
+            ovAddr.AutoSize = false;
+            ovAddr.Dock = DockStyle.Fill;
+            ovAddr.ForeColor = SystemColors.GrayText;
+            ovAddr.TextAlign = ContentAlignment.MiddleLeft;
+            ovAddr.Margin = new Padding(0);
+            ovAddr.Text = "—";
+            t.Controls.Add(ovAddr, 1, 6);
+
+            var note = new Label();
+            note.Dock = DockStyle.Fill;
+            note.AutoSize = false;
+            note.ForeColor = SystemColors.GrayText;
+            note.Padding = new Padding(0, 10, 0, 0);
+            note.Text = "提示：访问地址带一次性 token，只在本机 127.0.0.1 生效；粘贴给别人前请先去掉 ?token=… 部分。\r\n"
+                + "若页面里的按钮点了没反应，多半是浏览器里还开着旧版页面：关掉旧标签页重开即可（或按 Ctrl+F5）。";
+            t.Controls.Add(note, 0, 7);
+            t.SetColumnSpan(note, 2);
+            return page;
+        }
+
+        private static Label AddRow(TableLayoutPanel t, int row, string caption)
+        {
+            var c = new Label();
+            c.Text = caption;
+            c.AutoSize = true;
+            c.ForeColor = SystemColors.GrayText;
+            c.Anchor = AnchorStyles.Left;
+            c.Margin = new Padding(0, 6, 8, 0);
+            t.Controls.Add(c, 0, row);
+
+            var v = new Label();
+            v.Text = "—";
+            v.AutoSize = true;
+            v.Anchor = AnchorStyles.Left;
+            v.Margin = new Padding(0, 6, 0, 0);
+            t.Controls.Add(v, 1, row);
+            return v;
+        }
+
+        private static void SetHint(Label target, string text)
+        {
+            target.Text = text;
+        }
+
+        // ---------------- 更新 ----------------
+
+        private TabPage BuildUpdatesTab()
+        {
+            var page = new TabPage("更新");
+            page.Padding = new Padding(10, 10, 10, 10);
+
+            var t = new TableLayoutPanel();
+            t.Dock = DockStyle.Fill;
+            t.ColumnCount = 1;
+            t.RowCount = 3;
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            page.Controls.Add(t);
+
+            updHint = new Label();
+            updHint.Dock = DockStyle.Fill;
+            updHint.Text = "点“检查更新”查询 dsh 本体与第三方插件的新版本。";
+            t.Controls.Add(updHint, 0, 0);
+
+            updList = new FlowLayoutPanel();
+            updList.Dock = DockStyle.Fill;
+            updList.FlowDirection = FlowDirection.TopDown;
+            updList.WrapContents = false;
+            updList.AutoScroll = true;
+            updList.BackColor = SystemColors.Window;
+            updList.BorderStyle = BorderStyle.FixedSingle;
+            updList.SizeChanged += delegate { FitUpdateRows(); };
+            t.Controls.Add(updList, 0, 1);
+
+            var bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Fill;
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            bar.WrapContents = false;
+            t.Controls.Add(bar, 0, 2);
+
+            updRefresh = NewButton("检查更新", 92);
+            updRefresh.Click += delegate { RefreshUpdates(); };
+            updSelectAll = NewButton("全选", 60);
+            updSelectAll.Click += delegate { SetAllChecks(true); };
+            updSelectNone = NewButton("全不选", 68);
+            updSelectNone.Click += delegate { SetAllChecks(false); };
+            updApply = NewButton("开始更新选中项", 128);
+            updApply.Click += delegate { StartUpdate(); };
+            updCancelBtn = NewButton("取消", 60);
+            updCancelBtn.Enabled = false;
+            updCancelBtn.Click += delegate
+            {
+                updateCancel.Set();
+                updHint.Text = "已请求取消，正在收尾…";
+            };
+            bar.Controls.Add(updRefresh);
+            bar.Controls.Add(updSelectAll);
+            bar.Controls.Add(updSelectNone);
+            bar.Controls.Add(updApply);
+            bar.Controls.Add(updCancelBtn);
+            return page;
+        }
+
+        public void SelectUpdatesTab()
+        {
+            try { if (tabs.TabPages.Count > 1) tabs.SelectedIndex = 1; } catch { }
+        }
+
+        public void SelectPluginsTab()
+        {
+            try { if (tabs.TabPages.Count > 2) tabs.SelectedIndex = 2; } catch { }
+        }
+
+        private void SetAllChecks(bool value)
+        {
+            foreach (UpdateRow r in updRows) r.Check.Checked = value;
+        }
+
+        public void RefreshUpdates()
+        {
+            if (updBusy) return;
+            updHint.Text = "正在查询 npm（dsh 本体 + 各 profile 第三方插件）…";
+            updRefresh.Enabled = false;
+            var t = new Thread(delegate ()
+            {
+                List<UpdateCandidate> items = null;
+                try { items = CollectUpdateCandidates(); }
+                catch (Exception ex) { Log("检查更新异常: " + ex.Message); }
+                List<UpdateCandidate> copy = items;
+                Ui(delegate { PopulateUpdates(copy); });
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void PopulateUpdates(List<UpdateCandidate> items)
+        {
+            updRefresh.Enabled = true;
+            foreach (UpdateRow r in updRows) r.Dispose();
+            updRows.Clear();
+            updList.Controls.Clear();
+
+            if (items == null)
+            {
+                updHint.Text = "检查失败：无法访问 npm 仓库（可能断网）。可稍后重试。";
+                return;
+            }
+            if (items.Count == 0)
+            {
+                string extra = "";
+                if (skippedPluginUpdates != null && skippedPluginUpdates.Count > 0)
+                    extra = "（另有 " + skippedPluginUpdates.Count + " 个插件新版本与当前 dsh 不兼容，已自动跳过）";
+                updHint.Text = "已是最新：dsh 本体与第三方插件都没有可用新版本。" + extra;
+                return;
+            }
+            foreach (UpdateCandidate it in items)
+            {
+                var row = new UpdateRow(it);
+                updRows.Add(row);
+                updList.Controls.Add(row);
+            }
+            FitUpdateRows();
+            updHint.Text = "发现 " + items.Count + " 项可更新。勾选后点“开始更新选中项”。";
+        }
+
+        /// <summary>让每一行铺满列表面板宽度（否则明细里的“速度/剩余时间”会被右侧裁掉）。</summary>
+        private void FitUpdateRows()
+        {
+            try
+            {
+                int w = updList.ClientSize.Width - 28;
+                if (w < 220) w = 220;
+                foreach (UpdateRow r in updRows) r.Width = w;
+            }
+            catch { }
+        }
+
+        private UpdateRow RowFor(UpdateCandidate item)
+        {
+            foreach (UpdateRow r in updRows) if (object.ReferenceEquals(r.Item, item)) return r;
+            return null;
+        }
+
+        private void StartUpdate()
+        {
+            if (updBusy) return;
+            var chosen = new List<UpdateCandidate>();
+            foreach (UpdateRow r in updRows) if (r.Check.Checked) chosen.Add(r.Item);
+            if (chosen.Count == 0)
+            {
+                MessageBox.Show(this, "请至少勾选一项要更新的内容。", AppTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            updateCancel.Reset();
+            updBusy = true;
+            updApply.Enabled = false;
+            updRefresh.Enabled = false;
+            updSelectAll.Enabled = false;
+            updSelectNone.Enabled = false;
+            updCancelBtn.Enabled = true;
+            updHint.Text = "正在更新…可以点“取消”中断；已备份的内容可回滚。";
+            var t = new Thread(delegate () { RunUpdateWorker(chosen); });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void RunUpdateWorker(List<UpdateCandidate> chosen)
+        {
+            int okCount = 0, failCount = 0;
+            var summary = new StringBuilder();
+            foreach (UpdateCandidate item in chosen)
+            {
+                UpdateRow row = RowFor(item);
+                var prog = new ProgressInfo();
+                if (row != null) { row.Info = prog; Ui(delegate { row.ShowRunning(); }); }
+
+                string err;
+                if (item.Kind == "dsh")
+                {
+                    try { WriteVersionState(pinnedVersion, null, DateTime.Now, item.Latest); } catch { }
+                    err = InstallVersionProgress(item.Latest, prog, updateCancel);
+                    if (err == null)
+                    {
+                        pinnedVersion = item.Latest;
+                        try { WriteVersionState(item.Latest, null, DateTime.Now); } catch { }
+                        try { SetTrayText("DeepSeek Harness 服务运行中（新版本 " + item.Latest + " 已装好）"); } catch { }
+                        summary.AppendLine("· dsh 本体已装好：" + item.Latest + "（重启启动器后生效）");
+                    }
+                    else
+                    {
+                        try { WriteVersionState(pinnedVersion, item.Latest, DateTime.Now); } catch { }
+                        summary.AppendLine("· dsh 本体更新失败：" + err);
+                    }
+                }
+                else
+                {
+                    err = UpdatePluginAtomic(item.ProfileDir, item.Package, item.Latest, prog, updateCancel);
+                    if (err == null) summary.AppendLine("· 插件已更新：" + item.Label + " → " + item.Latest);
+                    else summary.AppendLine("· 插件更新失败：" + item.Label + "：" + err);
+                }
+
+                if (err == null) okCount++; else failCount++;
+                prog.Finished = true;
+                prog.Failed = err != null;
+                if (row != null) { string e = err; Ui(delegate { row.ShowDone(e); }); }
+
+                if (updateCancel.WaitOne(0))
+                {
+                    summary.AppendLine("（已按请求取消，剩余项未执行）");
+                    break;
+                }
+            }
+
+            try { SetTrayText("DeepSeek Harness 服务运行中（右键可停止）"); } catch { }
+            string text = summary.ToString().TrimEnd();
+            int ok = okCount, fail = failCount;
+            Ui(delegate
+            {
+                updBusy = false;
+                updApply.Enabled = true;
+                updRefresh.Enabled = true;
+                updSelectAll.Enabled = true;
+                updSelectNone.Enabled = true;
+                updCancelBtn.Enabled = false;
+                updHint.Text = "本次更新结束：成功 " + ok + " 项，失败 " + fail + " 项。";
+                if (text.Length > 0)
+                    MessageBox.Show(this, text + (ok > 0 ? "\n\n插件更新即刻生效；dsh 本体更新需重启启动器。" : ""),
+                        AppTitle, MessageBoxButtons.OK,
+                        fail > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                RefreshStatus();
+            });
+        }
+
+        /// <summary>进度定时器：把后台线程写进 ProgressInfo 的数据刷到对应进度条。</summary>
+        private void TickProgress()
+        {
+            if (!updBusy) return;
+            foreach (UpdateRow r in updRows)
+            {
+                if (r.Info != null && r.Running) r.ShowProgress(r.Info);
+            }
+        }
+
+        // ---------------- 插件 ----------------
+
+        private TabPage BuildPluginsTab()
+        {
+            var page = new TabPage("插件");
+            page.Padding = new Padding(10, 10, 10, 10);
+
+            var t = new TableLayoutPanel();
+            t.Dock = DockStyle.Fill;
+            t.ColumnCount = 1;
+            t.RowCount = 2;
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            page.Controls.Add(t);
+
+            plugList = new ListView();
+            plugList.Dock = DockStyle.Fill;
+            plugList.View = View.Details;
+            plugList.FullRowSelect = true;
+            plugList.GridLines = true;
+            plugList.ShowItemToolTips = true;
+            plugList.Columns.Add("插件", 240);
+            plugList.Columns.Add("配置", 70);
+            plugList.Columns.Add("判定", 150);
+            plugList.Columns.Add("说明", 300);
+            plugList.SizeChanged += delegate { FitPluginColumns(); };
+            t.Controls.Add(plugList, 0, 0);
+
+            var bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Fill;
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            bar.WrapContents = false;
+            t.Controls.Add(bar, 0, 1);
+
+            plugRefresh = NewButton("重新检查", 92);
+            plugRefresh.Click += delegate { RefreshPlugins(); };
+            plugDisable = NewButton("禁用不兼容插件", 128);
+            plugDisable.Click += delegate { DisableBadPlugins(); };
+            // 按钮文字保持短，详细说明放在确认对话框里（长文字会被按钮边界裁掉）
+            var safe = NewButton("进入安全模式", 120);
+            safe.Click += delegate { EnterSafeModeUi(); };
+            bar.Controls.Add(plugRefresh);
+            bar.Controls.Add(plugDisable);
+            bar.Controls.Add(safe);
+            return page;
+        }
+
+        /// <summary>插件列表按窗口宽度分配列宽，避免“判定/说明”被右边裁掉。</summary>
+        private void FitPluginColumns()
+        {
+            try
+            {
+                int w = plugList.ClientSize.Width;
+                if (w < 300 || plugList.Columns.Count < 4) return;
+                plugList.Columns[0].Width = (int)(w * 0.24);
+                plugList.Columns[1].Width = (int)(w * 0.09);
+                plugList.Columns[2].Width = (int)(w * 0.24);
+                plugList.Columns[3].Width = (int)(w * 0.43);
+            }
+            catch { }
+        }
+
+        public void RefreshPlugins()
+        {
+            plugRefresh.Enabled = false;
+            var t = new Thread(delegate ()
+            {
+                List<PluginCompat> all = null;
+                try { all = ScanProfilePlugins(); }
+                catch (Exception ex) { Log("插件扫描异常: " + ex.Message); }
+                List<PluginCompat> copy = all;
+                Ui(delegate { PopulatePlugins(copy); });
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void PopulatePlugins(List<PluginCompat> all)
+        {
+            plugRefresh.Enabled = true;
+            plugList.Items.Clear();
+            if (all == null || all.Count == 0)
+            {
+                var empty = new ListViewItem("（没有检测到第三方插件）");
+                plugList.Items.Add(empty);
+                return;
+            }
+            foreach (PluginCompat p in all)
+            {
+                var it = new ListViewItem(p.Name);
+                it.SubItems.Add(p.Profile);
+                it.SubItems.Add(p.VerdictShort());
+                it.SubItems.Add(p.Supported == "-" ? "" : ("声明支持：" + p.Supported));
+                it.ToolTipText = p.Name + "（" + p.Profile + "）：" + p.VerdictText()
+                    + (p.Supported != "-" ? "\n声明支持：" + p.Supported : "")
+                    + "\n实际解析到：" + p.HarnessSummary();
+                if (p.Verdict == "fatal") it.ForeColor = Color.Firebrick;
+                else if (p.Verdict == "risky") it.ForeColor = Color.DarkOrange;
+                plugList.Items.Add(it);
+            }
+            FitPluginColumns();
+        }
+
+        private void DisableBadPlugins()
+        {
+            List<PluginCompat> all;
+            try { all = ScanProfilePlugins(); }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "插件检查失败：" + ex.Message, AppTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var bad = new List<PluginCompat>();
+            foreach (PluginCompat p in all) if (p.Fatal) bad.Add(p);
+            if (bad.Count == 0)
+            {
+                MessageBox.Show(this, "没有发现会在加载期抛错的插件，无需禁用。", AppTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var names = new StringBuilder();
+            foreach (PluginCompat p in bad) names.AppendLine("· " + p.Name + "（" + p.Profile + "）");
+            if (MessageBox.Show(this, "以下插件会让服务起不来，是否禁用（改前会备份）？\n\n" + names,
+                    AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            var rep = new StringBuilder();
+            foreach (PluginCompat p in bad) rep.AppendLine(DisablePluginEverywhere(p.Name, null));
+            Log("控制面板：已禁用不兼容插件" + Environment.NewLine + rep.ToString());
+            MessageBox.Show(this, "已禁用 " + bad.Count + " 个插件。\n\n" + rep,
+                AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            RefreshPlugins();
+        }
+
+        private void EnterSafeModeUi()
+        {
+            if (MessageBox.Show(this,
+                    "安全模式会暂时摘除**全部第三方插件**（每个 profile 都会先整份备份），\n" +
+                    "让服务一定能启动。之后可在托盘菜单里还原。\n\n确定进入安全模式吗？",
+                    AppTitle, MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            List<string> disabled = EnterSafeMode();
+            MessageBox.Show(this, "已摘除 " + disabled.Count + " 个第三方插件。\n\n" +
+                "请用托盘 →“停止服务并退出”，再重新双击启动器；服务将以“无第三方插件”方式启动。",
+                AppTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            RefreshPlugins();
+        }
+
+        // ---------------- 日志 ----------------
+
+        private TabPage BuildLogTab()
+        {
+            var page = new TabPage("日志");
+            page.Padding = new Padding(10, 10, 10, 10);
+
+            var t = new TableLayoutPanel();
+            t.Dock = DockStyle.Fill;
+            t.ColumnCount = 1;
+            t.RowCount = 2;
+            t.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            t.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            page.Controls.Add(t);
+
+            logBox = new TextBox();
+            logBox.Dock = DockStyle.Fill;
+            logBox.Multiline = true;
+            logBox.ReadOnly = true;
+            logBox.ScrollBars = ScrollBars.Both;
+            logBox.WordWrap = false;
+            logBox.BackColor = SystemColors.Window;
+            logBox.Font = new Font("Consolas", 9f);
+            t.Controls.Add(logBox, 0, 0);
+
+            var bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Fill;
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            bar.WrapContents = false;
+            t.Controls.Add(bar, 0, 1);
+
+            logRefresh = NewButton("刷新", 60);
+            logRefresh.Click += delegate { RefreshLog(); };
+            logOpen = NewButton("打开日志文件", 100);
+            logOpen.Click += delegate
+            {
+                try { Process.Start(new ProcessStartInfo(LogFile) { UseShellExecute = true }); }
+                catch (Exception ex) { MessageBox.Show(this, "打开失败：" + ex.Message, AppTitle); }
+            };
+            bar.Controls.Add(logRefresh);
+            bar.Controls.Add(logOpen);
+            return page;
+        }
+
+        private void RefreshLog()
+        {
+            try
+            {
+                if (!File.Exists(LogFile)) return;
+                string[] lines = File.ReadAllLines(LogFile);
+                int take = Math.Min(400, lines.Length);
+                var sb = new StringBuilder();
+                for (int i = lines.Length - take; i < lines.Length; i++) sb.AppendLine(lines[i]);
+                string text = sb.ToString();
+                if (text != logBox.Text)
+                {
+                    logBox.Text = text;
+                    logBox.SelectionStart = logBox.TextLength;
+                    logBox.ScrollToCaret();
+                }
+            }
+            catch { }
+        }
+
+        // ---------------- 关于 ----------------
+
+        private TabPage BuildAboutTab()
+        {
+            var page = new TabPage("关于");
+            page.Padding = new Padding(16, 14, 16, 14);
+            aboutLabel = new Label();
+            aboutLabel.Dock = DockStyle.Fill;
+            aboutLabel.Text =
+                AppTitle + "  v" + LauncherVersion + "\r\n\r\n" +
+                "作用：直接启动本机已装的 DeepSeek Harness（dsh），自动打开网页，" +
+                "并在浏览器全部关闭或托盘操作时停止服务。\r\n\r\n" +
+                "· 状态与日志目录：" + AppDataDir + "\r\n" +
+                "· dsh profiles 目录：" + DshProfilesRoot() + "\r\n" +
+                "· npm 缓存目录：" + Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "npm-cache") + "\r\n\r\n" +
+                "更新机制：dsh 本体走 npm 安装（失败自动回退到原版本）；" +
+                "第三方插件为文件级安装（下载 → SHA1 校验 → 原子替换，改前整目录备份）。\r\n" +
+                "安全兜底：任何 profile 改动前都会备份到 .backup-<时间戳>；" +
+                "“安全模式”可一键摘除全部第三方插件以恢复启动。\r\n\r\n" +
+                "本程序只监听 127.0.0.1，不对外提供服务；带 token 的访问地址不会离开本机。";
+            page.Controls.Add(aboutLabel);
+            return page;
+        }
+
+        // ---------------- 状态刷新 ----------------
+
+        public void RefreshStatus()
+        {
+            try
+            {
+                int svcPid = NetstatListenPid(Port);
+                bool running = svcPid > 0;
+                bool own = serverProcess != null && !serverProcess.HasExited;
+
+                dot.BackColor = running ? Color.SeaGreen : SystemColors.GrayText;
+                if (running)
+                {
+                    state.Text = "服务运行中";
+                    state.ForeColor = SystemColors.ControlText;
+                }
+                else
+                {
+                    state.Text = "服务已停止";
+                    state.ForeColor = SystemColors.GrayText;
+                }
+
+                if (IsSafeMode()) state.Text += "（安全模式）";
+
+                string v = string.IsNullOrEmpty(pinnedVersion) ? DetectInstalledVersion() : pinnedVersion;
+                ver.Text = "使用版本：" + (string.IsNullOrEmpty(v) ? "未记录" : v)
+                    + "　·　本启动器 v" + LauncherVersion;
+
+                if (running)
+                {
+                    pid.Text = "服务进程：PID " + svcPid + (own ? "（本程序启动）" : "（外部/上次遗留）");
+                }
+                else
+                {
+                    pid.Text = "服务进程：无";
+                }
+
+                ovState.Text = running ? (own ? "运行中（本程序启动）" : "运行中（外部进程）") : "已停止";
+                ovVersion.Text = string.IsNullOrEmpty(v) ? "未记录" : v;
+
+                DateTime? start = running ? SafeStartTime(svcPid) : null;
+                ovPid.Text = running ? ("PID " + svcPid) : "—";
+                ovStart.Text = start.HasValue ? start.Value.ToString("yyyy-MM-dd HH:mm:ss") : "—";
+                if (start.HasValue)
+                {
+                    TimeSpan up = DateTime.Now - start.Value;
+                    ovUptime.Text = FormatDuration(up);
+                }
+                else ovUptime.Text = "—";
+
+                string url = CurrentUrl();
+                if (ovUrlBox.Text != url) ovUrlBox.Text = url;
+                ovAddr.Text = running ? "已就绪（点“复制”可复制带 token 地址）" : "服务未运行";
+
+                actOpen.Enabled = running;
+                actStop.Enabled = true;
+            }
+            catch (Exception ex)
+            {
+                Log("刷新状态失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 构造冒烟测试（自检用）：创建句柄、跑一遍布局与状态刷新，回读关键控件是否建好。
+        /// 只在 DSH_LAUNCHER_UI_TEST=1 时被调用，不会真的把窗口显示出来。
+        /// </summary>
+        public string SmokeTest()
+        {
+            CreateControl();
+            PerformLayout();
+            RefreshStatus();
+            int tabCount = tabs == null ? -1 : tabs.TabPages.Count;
+            var names = new StringBuilder();
+            if (tabs != null)
+            {
+                for (int i = 0; i < tabs.TabPages.Count; i++)
+                {
+                    if (i > 0) names.Append("|");
+                    names.Append(tabs.TabPages[i].Text);
+                }
+            }
+            bool keys = actOpen != null && actCheck != null && actStop != null
+                && updList != null && plugList != null && logBox != null && ovUrlBox != null
+                && tabs != null;
+            return "ui_form_created=True"
+                + "\r\nui_tabs=" + tabCount
+                + "\r\nui_tab_names=" + names
+                + "\r\nui_key_controls=" + keys
+                + "\r\nui_has_tray_icon=" + (Icon != null)
+                + "\r\nui_refresh_status_ok=True";
+        }
+
+        /// <summary>
+        /// 版式验收（自检用）：在屏幕外显示窗口，逐页签渲染成 PNG，便于核对界面。
+        /// 只在 DSH_LAUNCHER_UI_TEST=1 时调用；会临时填几行演示数据以便看出进度条效果。
+        /// </summary>
+        public string RenderShots(string dir)
+        {
+            var report = new StringBuilder();
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(-4000, -4000);
+            Show();
+            Application.DoEvents();
+            try
+            {
+                for (int i = 0; i < tabs.TabPages.Count; i++)
+                {
+                    tabs.SelectedIndex = i;
+                    Application.DoEvents();
+
+                    // 给“更新/插件/日志”页填演示数据，好让版式看得出真实效果
+                    if (i == 1 && updRows.Count == 0)
+                    {
+                        var a = new UpdateCandidate { Kind = "dsh", Label = "DeepSeek Harness（本体）", Current = "0.1.5-rc.3", Latest = "0.2.0-rc.2" };
+                        var b = new UpdateCandidate { Kind = "plugin", Label = "@nanmicoder/dsh-agent-teams（web）", Current = "0.1.21", Latest = "0.1.22" };
+                        var ra = new UpdateRow(a);
+                        var rb = new UpdateRow(b);
+                        updList.Controls.Add(ra);
+                        updList.Controls.Add(rb);
+                        updRows.Add(ra);
+                        updRows.Add(rb);
+                        FitUpdateRows();
+                        updHint.Text = "发现 2 项可更新。勾选后点“开始更新选中项”。";
+                        ra.ShowRunning();
+                        var p1 = new ProgressInfo();
+                        p1.Phase = "下载并安装依赖";
+                        p1.Received = 18L * 1024 * 1024;
+                        p1.Total = -1;
+                        p1.BytesPerSec = 1.6 * 1024 * 1024;
+                        p1.Elapsed = TimeSpan.FromSeconds(47);
+                        ra.ShowProgress(p1);
+                        rb.ShowRunning();
+                        var p2 = new ProgressInfo();
+                        p2.Phase = "下载中";
+                        p2.Received = 900 * 1024;
+                        p2.Total = 2048 * 1024;
+                        p2.BytesPerSec = 288 * 1024;
+                        p2.Elapsed = TimeSpan.FromSeconds(3);
+                        rb.ShowProgress(p2);
+                        Application.DoEvents();
+                    }
+                    if (i == 2 && plugList.Items.Count == 0)
+                    {
+                        var it = new ListViewItem("@nanmicoder/dsh-agent-teams");
+                        it.SubItems.Add("web");
+                        it.SubItems.Add("版本混杂（能跑）");
+                        it.SubItems.Add("声明支持：0.1.7-rc.2,0.1.5-rc.3");
+                        it.ToolTipText = "@nanmicoder/dsh-agent-teams（web）：版本混杂，但该插件不做加载期校验（能跑，行为可能异常）";
+                        it.ForeColor = Color.DarkOrange;
+                        plugList.Items.Add(it);
+                        var it2 = new ListViewItem("dsh-perm-gate");
+                        it2.SubItems.Add("web");
+                        it2.SubItems.Add("兼容");
+                        it2.SubItems.Add("");
+                        plugList.Items.Add(it2);
+                        FitPluginColumns();
+                        Application.DoEvents();
+                    }
+                    if (i == 3) { logBox.Text = "17:30:00.001  === 启动器开始运行（v0.7.0）===\r\n17:30:00.120  服务就绪，耗时 9.1 秒\r\n17:30:00.400  接口自检：通过（client-api 通路正常）\r\n17:30:05.000  启动更新检查：发现 2 项可更新\r\n"; }
+
+                    string f = Path.Combine(dir, "ui-tab-" + i + ".png");
+                    using (var bmp = new Bitmap(Width, Height))
+                    {
+                        DrawToBitmap(bmp, new Rectangle(0, 0, Width, Height));
+                        bmp.Save(f, System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    report.AppendLine("shot[" + i + "][" + tabs.TabPages[i].Text + "]=" + f);
+                }
+            }
+            finally { Hide(); }
+            report.AppendLine("ui_buttons=" + DumpButtonWidths());
+            return report.ToString();
+        }
+
+        private string DumpButtonWidths()
+        {
+            var sb = new StringBuilder();
+            DumpButtonsRec(this, sb);
+            return sb.ToString();
+        }
+
+        private static void DumpButtonsRec(Control root, StringBuilder sb)
+        {
+            foreach (Control c in root.Controls)
+            {
+                Button b = c as Button;
+                if (b != null && !string.IsNullOrEmpty(b.Text))
+                    sb.Append(b.Text).Append(":w=").Append(b.Width)
+                      .Append(",pref=").Append(b.PreferredSize.Width).Append(" | ");
+                if (c.HasChildren) DumpButtonsRec(c, sb);
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // 关窗只是隐藏：本程序是托盘常驻，退出统一走托盘的“停止服务并退出”
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                return;
+            }
+            base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                try { if (fastTimer != null) fastTimer.Dispose(); } catch { }
+                try { if (slowTimer != null) slowTimer.Dispose(); } catch { }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>更新列表里的一行：勾选框 + 标题 + 进度条 + 明细（阶段/速度/耗时/剩余）。</summary>
+    private sealed class UpdateRow : Panel
+    {
+        public UpdateCandidate Item;
+        public ProgressInfo Info;
+        public CheckBox Check;
+        public bool Running;
+
+        private Label title;
+        private Label detail;
+        private ProgressBar bar;
+        private bool marquee;
+
+        public UpdateRow(UpdateCandidate item)
+        {
+            Item = item;
+            Width = 640;
+            Height = 88;
+            Margin = new Padding(4, 3, 4, 3);
+            BorderStyle = BorderStyle.FixedSingle;
+            BackColor = SystemColors.Window;
+
+            Check = new CheckBox();
+            Check.SetBounds(10, 12, 18, 18);
+            Check.Checked = true;
+            Controls.Add(Check);
+
+            title = new Label();
+            title.SetBounds(34, 8, Width - 48, 20);
+            title.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            title.Font = new Font(Font, FontStyle.Bold);
+            title.Text = item.Label + "   " + item.Current + "  →  " + item.Latest;
+            Controls.Add(title);
+
+            bar = new ProgressBar();
+            bar.SetBounds(34, 30, Width - 48, 15);
+            bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            bar.Style = ProgressBarStyle.Continuous;
+            Controls.Add(bar);
+
+            // 明细允许两行：速度/已用/剩余都齐时单行可能放不下，换行比截断好
+            detail = new Label();
+            detail.AutoSize = false;
+            detail.SetBounds(34, 48, Width - 48, 34);
+            detail.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            detail.ForeColor = SystemColors.GrayText;
+            detail.Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 8.25f);
+            detail.Text = item.Kind == "dsh" ? "等待（后台下载，失败自动回退）" : "等待（下载 → 校验 → 原子替换）";
+            Controls.Add(detail);
+        }
+
+        /// <summary>当前进度条数值（自检断言用）。</summary>
+        public int BarValue { get { return bar == null ? -1 : bar.Value; } }
+
+        public void ShowRunning()
+        {
+            Running = true;
+            if (Check != null) Check.Enabled = false;
+            detail.Text = "准备中…";
+        }
+
+        public void ShowProgress(ProgressInfo p)
+        {
+            if (!Running) return;
+            try
+            {
+                int pct = p.Percent();
+                if (pct < 0)
+                {
+                    if (!marquee) { bar.Style = ProgressBarStyle.Marquee; bar.MarqueeAnimationSpeed = 30; marquee = true; }
+                }
+                else
+                {
+                    if (marquee) { bar.Style = ProgressBarStyle.Continuous; marquee = false; }
+                    if (pct < bar.Minimum) pct = bar.Minimum;
+                    if (pct > bar.Maximum) pct = bar.Maximum;
+                    bar.Value = pct;
+                }
+                detail.Text = p.DetailText();
+            }
+            catch { }
+        }
+
+        public void ShowDone(string error)
+        {
+            Running = false;
+            if (Check != null) Check.Enabled = true;
+            try
+            {
+                if (marquee) { bar.Style = ProgressBarStyle.Continuous; marquee = false; }
+                if (string.IsNullOrEmpty(error))
+                {
+                    bar.Value = bar.Maximum;
+                    detail.ForeColor = Color.SeaGreen;
+                    detail.Text = Item.Kind == "dsh"
+                        ? "已完成（重启启动器后生效）"
+                        : "已完成（已备份原版本，可回滚）";
+                }
+                else
+                {
+                    detail.ForeColor = Color.Firebrick;
+                    detail.Text = "失败：" + error;
+                }
+            }
+            catch { }
+        }
     }
 
     // ================= DPI =================

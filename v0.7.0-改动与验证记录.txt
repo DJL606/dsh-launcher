@@ -1,0 +1,225 @@
+================================================================
+v0.7.0 改动与验证记录
+================================================================
+生成时间：2026-10-01（GMT+8）
+源码：launcher.cs（单文件 C#，无第三方依赖，仅 C# 5 语法）
+产物：launcher-v070.exe / DeepSeek一键启动-v0.7.0.exe
+构建：build-v070.cmd（纯 ASCII）
+
+产物校验和（SHA-256）：
+  151afd3c746920833163fde7f5d7b538fec6957451c407261162f3120767f9f6  launcher-v070.exe
+  832f702dfeebbcff67484fdf512a9ebb670b0dc9b95319e785be2540e6b9091a  launcher.cs
+
+  ⚠ 注意：.NET 编译器会在 PE 头里写 MVID 与时间戳，所以**同一份源码重新编译
+  出来的 exe 哈希会变**（实测：同一 launcher.cs 两次构建得到
+  f2c4b1ae… 与 151afd3c…）。因此：
+    · 判断"是不是同一版本"请用 launcher.cs 的哈希 + 程序集版本号（0.7.0.0）；
+    · 不要用 exe 哈希做跨构建比对，也不要把它当作"文件是否被篡改"的依据。
+
+本版对应五项要求：
+ 1) 优化升级逻辑，UI 风格保持系统风格
+ 2) 为升级所有插件的过程添加进度条（下载时间 / 速度 / 进度）
+ 3) 重写 UI，让 UI 内容逻辑明了（重点）
+ 4) 提升软件整体稳定性，兼容各种工况
+ 5) 强化运行冗余（防止把环境"修坏"后救不回来）
+
+----------------------------------------------------------------
+一、UI 重写（要求 1、3）
+----------------------------------------------------------------
+旧版没有窗口：状态在托盘 tooltip、升级在 MessageBox、插件检查在 MessageBox、
+日志在文件里 —— 信息四处分散，用户要自己拼。
+
+新版：新增主窗口 `MainForm`（控制面板），系统标准控件 + 系统字体，
+无自绘皮肤。默认**隐藏**，双击托盘图标或托盘菜单"打开控制面板"才出现。
+
+  · 顶部状态条：状态色点 + "服务运行中/已停止" + 使用版本 + 服务 PID
+  · 主操作行：打开网页 / 检查更新 / 停止服务（均按文字自动定宽，不会裁字）
+  · 5 个页签：
+      概览 —— 服务状态/版本/PID/启动时间/运行时长/带 token 地址（可复制/重开）
+      更新 —— dsh 本体 + 各插件的逐项勾选与**逐项进度条**
+      插件 —— 第三方插件兼容性表格（判定/声明支持，悬停看完整说明）
+      日志 —— 实时 tail launcher.log
+      关于 —— 版本与各项路径
+  · 托盘菜单：打开控制面板 / 打开 DeepSeek 网页 / 检查 dsh·插件更新… /
+      插件兼容检查… / 切换版本 /（安全模式时）退出安全模式 / 停止服务并退出
+  · 托盘图标双击 = 打开控制面板（旧版是直接开网页，网页改由面板按钮承担）
+
+被删除的旧 UI（已被上面取代，避免新旧两套入口并存）：
+  `ShowUpdatePicker`（勾选对话框）、`ApplyUpdates`（旧批量执行）、
+  `UpdatePluginFile`（旧插件覆盖实现）。两个托盘旧入口
+  `CheckUpdatesFromTray` / `CheckPluginsFromTray` 改为打开面板对应页签。
+
+界面验收方式：内置 `DSH_LAUNCHER_UI_TEST=1` 会把窗口渲染成 PNG
+（窗口移到屏幕外，不会真的弹出来），逐页签输出到
+%TEMP%\dsh-launcher-ui-shots\。已据此发现并修掉 4 处版式缺陷：
+  ① "重新打开"按钮被父容器裁成"重新打"
+  ② 概览底部提示单行被截断（改为可换行）
+  ③ 更新页明细"剩余约 3…"被裁（加高行、明细可换行）
+  ④ 插件页按钮"禁用不兼容插"被裁（改为按文字自动定宽）
+
+----------------------------------------------------------------
+二、进度条与下载器（要求 2）
+----------------------------------------------------------------
+关键改动：不再用 `npm pack` 黑盒下载，改为**直接对 registry 的 tarball 发 HTTP 请求**，
+因此能拿到 Content-Length → 真实百分比。
+
+新增 `ProgressInfo` + `HttpDownloadToFile`：
+  · 真实字节进度（已下载 / 总量 / 百分比）
+  · 实时速度（每 400ms 采样窗口计算）
+  · 已用时间 + 预计剩余时间
+  · 阶段文字（查询版本信息 / 下载中 / 校验完整性 / 解包中 / 准备文件 /
+      备份原版本 / 替换文件 / 完成）
+  · **失败重试 3 次 + HTTP Range 断点续传**（这是本次实测暴露的刚需，见下）
+
+dsh 本体（`InstallVersionProgress`）：npm 依赖树总量无法预知，所以
+**不假装有百分比**，只如实显示"已下载 X / 速度 Y / 已用 Z"——
+通过采样 npx 缓存里本次新增目录的体积得到。
+
+----------------------------------------------------------------
+三、升级逻辑（要求 1）
+----------------------------------------------------------------
+插件更新重写为原子流程 `UpdatePluginAtomic`：
+  ① 取 registry 元数据（tarball 直链 + shasum）
+  ② 带进度下载到临时目录
+  ③ **SHA1 完整性校验**
+  ④ 纯 C# 解包 `.tar.gz`（内置实现，不依赖系统 tar.exe）
+  ⑤ 在**同一卷**上拼装 staging（并保留原插件自带的 node_modules）
+  ⑥ 整目录备份原版本
+  ⑦ `Directory.Move` rename 原子换入；失败自动 rename 回滚
+  ⑧ 回读版本号校验；失败再回滚
+  ⑨ 同步 profile 的 package.json 版本号
+  ⑩ 清理临时物（不留 .old-* / .staging-* 残留）
+
+【重要】修掉一个从 v0.6.7 继承下来的真 bug：
+  `Regex.Replace(text, pattern, "$1" + latest + "$3")`
+  当 latest 以数字开头（版本号永远如此）时，`$1` 会与后面的数字拼成不存在的
+  组 `$11`，把 package.json 写坏。实测把它变成了：
+      修改前：{"name":"web","dependencies":{"left-pad":"1.0.0"}}
+      修改后：{"name":"web","dependencies":{$11.3.0"}}      <= 坏文件
+  改为 MatchEvaluator 显式拼接后：
+      修改后：{"name":"web","dependencies":{"left-pad":"1.3.0"}}   <= 正确
+  这个 bug 之前一直没触发，是因为 09-27 那次插件更新在更早一步就失败了。
+
+----------------------------------------------------------------
+四、稳定性（要求 4）
+----------------------------------------------------------------
+  · 全局异常兜底：`Application.ThreadException` + `AppDomain.UnhandledException`
+    都先落日志，不再出现"一闪而过、无证据"的崩溃
+  · 状态文件 version.txt 改为**原子写**（写 .tmp → File.Replace → 旧文件留 .bak）
+  · 状态文件**损坏自愈**：主文件解析不到任何已知键时，自动从 .bak 恢复
+  · 下载失败重试 + 断点续传（见第二节）
+  · 插件覆盖改为原子替换（见第三节），不再是"逐文件覆盖、中断就半新半旧"
+  · 内置 `PruneBackups` 只清理**插件更新自动产生**的 .backup-update-*（保留最近 8 份），
+    **绝不碰**其它 .backup-*（排障/回滚点）——这一点是刻意写死的：
+    初版实现按"目录数量"删最旧的，会把你 09-27 留下的回滚备份当垃圾清掉，已改正。
+  · 解包器内置 `../` 路径穿越防御
+
+----------------------------------------------------------------
+五、冗余 / 安全模式（要求 5）
+----------------------------------------------------------------
+新增"安全模式"——插件或版本把服务改坏时的破窗通道：
+  · `EnterSafeMode()`：对本机每个 profile **先显式整份备份并记录路径**，
+    再摘除全部第三方插件（复用已验证的 DisablePluginEverywhere）
+  · 还原来源写入 %LOCALAPPDATA%\DeepSeekLauncher\safe-mode.txt
+  · `ExitSafeMode()`：按记录的备份路径逐个 profile 还原，再删标记
+  · 入口：面板"插件"页 → "进入安全模式"；托盘 → "退出安全模式"
+
+----------------------------------------------------------------
+六、验证证据（原始输出）
+----------------------------------------------------------------
+
+[1] 编译（与 build-v070.cmd 完全同参数，含图标/清单）
+  csc_exit=0
+  （零错误、零警告）
+  产物 FileVersion=0.7.0.0  Product=DeepSeek 一键启动器
+  icon_resource_tray(24)=24x24        <= 图标资源已内嵌
+
+[2] 完整自检（DSH_LAUNCHER_SELFTEST=1 + DSH_LAUNCHER_UI_TEST=1）
+  version=0.7.0.0
+  missing=none
+  svcrec_match_self=True
+  svcrec_mismatched_start_rejected=True
+  svcrec_clear_ok=True
+  heal_bak_created=True
+  heal_recovered=True value=9.9.9-heal        <= 状态文件损坏自愈通过
+  port_owner=dsh pid=64352 proc=node
+  plugins_scanned=4
+  update_candidates=3
+  log_write=ok
+  ui_form_created=True
+  ui_tabs=5
+  ui_tab_names=概览|更新|插件|日志|关于
+  ui_key_controls=True
+  ui_row_percent=50
+  ui_row_bar_value=50
+  ui_test_ok=True
+
+[3] 带进度下载（本地 HTTP 服务，3,000,000 字节）
+  dl_error=<none>
+  dl_bytes=3000000 total_reported=3000000 expect=3000000
+  dl_match=True
+  dl_progress_text=等待中 100%（2.9 MB / 2.9 MB）
+
+[4] 真实 registry tarball 下载（@nanmicoder/dsh-agent-teams@0.1.21）
+  dl_bytes=2093846 total_reported=2093846 expect=2093846
+  dl_match=True
+  dl_elapsed_ms=8944
+
+[5] 断点续传（自写 Range 服务器，首个请求在第 1,048,576 字节处切断连接）
+  服务端日志：FULL (will cut at 1000000) → RANGE start=1048576
+  客户端：dl_bytes=3000000  dl_match=True
+  => 重试 + Range 续传真实生效
+
+[6] 纯 C# 解包 .tar.gz（3 个文件的自制包）
+  tar_ok=True
+  tar_files=3 expect=3 match=True
+  tar_package_json=present
+  tar_package_version=1.2.3
+
+[7] 插件原子替换端到端（真实 npm 包 left-pad 1.0.0 → 1.3.0，临时 profile 副本）
+  atomic_error=<none>
+  atomic_installed_version=1.3.0
+  atomic_match=True
+  atomic_progress=完成 100%（3.5 KB / 3.5 KB）
+  atomic_package_json_spec=1.3.0
+  atomic_leftover_dirs=0
+  另核对：原插件自带 node_modules/dep-marker.txt 被保留；旧 index.js 已被新文件替换
+
+[8] 负例：目标版本不存在（left-pad → 99.99.99）
+  atomic_error=无法获取下载地址（网络不通，或该版本在 registry 上不存在）
+  atomic_installed_version=1.3.0        <= 原版本完好
+  atomic_package_json_spec=1.3.0        <= package.json 未被改动
+  原 index.js 内容仍为 ORIGINAL-KEEP
+
+[9] scoped 包端到端（@nanmicoder/dsh-agent-teams 0.1.0 → 0.1.21）
+  首次运行遇到瞬时网络卡顿："下载失败：操作已超时"，
+  进度停在 98%（2.0 MB / 2.0 MB）——这正是加入重试/续传的直接动因；
+  同一 URL 重跑即成功（dl_bytes=2093846 / 8.9 秒）。
+
+[10] 界面截图（%TEMP%\dsh-launcher-ui-shots\ui-tab-*.png，5 张）
+  逐张核对过：表头无遮挡、按钮无裁字、明细完整、表格列可用。
+
+----------------------------------------------------------------
+七、备份与回滚
+----------------------------------------------------------------
+  · 旧版可执行文件仍在：DeepSeek一键启动-v0.6.5 / -v0.6.6 / -v0.6.7.exe
+    换回旧版只需改双击哪个文件，不需要改动任何配置。
+  · 旧构建脚本保留：build-v065.cmd / build-v066.cmd / build-v067.cmd
+  · profile 改动前备份：<profile>\.backup-<时间戳>\
+  · 插件更新前备份：<profile>\.backup-update-<时间戳>\<包名>\
+  · 安全模式还原来源：%LOCALAPPDATA%\DeepSeekLauncher\safe-mode.txt
+  · 本次开发全程未改动用户的真实 profile / version.txt / settings.yaml。
+    所有写操作都发生在 %TEMP% 的临时副本上（原子替换测试用
+    DSH_LAUNCHER_ATOMIC_TEST 指向临时 profile；状态自愈测试用
+    DSH_LAUNCHER_STATE_FILE 指向临时状态文件）。
+
+----------------------------------------------------------------
+八、已知限制 / 未做
+----------------------------------------------------------------
+  1) dsh 本体的 npm 依赖树无法预知总字节数，所以那一行是"已下载量 + 速度 +
+     已用时间"，**不是**百分比。这是如实呈现，不是缺陷。
+  2) 进度条使用系统原生 ProgressBar；在"窗口离屏 + DrawToBitmap"这种方式下
+     连续进度的填充色不被截图捕获（功能正确性已用 ui_row_bar_value=50 断言），
+     屏幕上看是正常的。
+  3) 托盘菜单里的"切换版本"仍沿用旧逻辑（写状态文件、重启生效），未在本版重做。
+================================================================
